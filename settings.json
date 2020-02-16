@@ -1,0 +1,13 @@
+{
+	"name": "ddos-defender",
+	"rest": false,
+	"cli": false,
+	"crit_good_flows" : 3,
+	"alpha" : "0.2",
+	"threshold_low" : "0.3",
+	"threshold_hight" : "0.9",
+	"threshold_cpu_util" : "30",
+	"THRESHOLD" : 100,
+	"interval" : 3,
+	"hosts_amount" : 8
+}
