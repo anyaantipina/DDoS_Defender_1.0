@@ -5,6 +5,7 @@
 #include "api/Switch.hpp"
 #include "Loader.hpp"
 #include "HostManager.hpp"
+#include "OFMsgSender.hpp"
 
 #include "oxm/openflow_basic.hh"
 #include "oxm/field_set.hh"
@@ -57,21 +58,23 @@ struct counters{
     int prev_counter;
 };
 
+//for testing
+/*struct flow_stat{
+    flow_stat();
+    int inf_count;
+    int usr_count;
+    std::vector<of13::FlowStats> stats;
+    bool done;
+};*/
+
 class DDoS_Defender : public Application {
     Q_OBJECT
     SIMPLE_APPLICATION(DDoS_Defender, "ddos-defender")
 private:
-    OFMessageHandlerPtr handler_;
-    bool ATTACK;
-    bool BuildDone;
-    bool HostsDone;
-    static int THRESHOLD;
-    static int crit_good_flows;
-    static float alpha;
-    static int interval;
-    //bool test_interval; //for testing
+    OFMessageHandlerPtr handler_, handler_flow_stats_;
 
     SwitchManager* switch_manager_;
+    OFMsgSender* sender_;
     std::vector<host_info> hosts;
     std::unordered_map<std::string, host_info> RevIPBindTable;
     std::unordered_map<std::string, host_info> IPBindTable;
@@ -79,7 +82,7 @@ private:
     std::unordered_map<std::string, score> src_criterion;
     std::unordered_map<std::string, counters> attack_end;
     std::unordered_map<uint64_t, bool> sw_response;
-
+    
     //std::unordered_map<uint64_t,flow_stat> switch_flow_test; //for testing
 
     void add_to_RevTable(std::string, std::string, uint32_t, uint64_t);
@@ -95,15 +98,15 @@ private:
     void timerEvent(QTimerEvent*) override;
 
     void send_init_flowmods();
+    void send_drop_flowmod(uint64_t, uint32_t);
 
     //for testing
     //void add_flow_statistic_from_switch(std::vector<of13::FlowStats>, uint64_t);
-    //void print_flow_test();
 
     void add_src_statistic_from_switch(std::vector<of13::FlowStats>, uint64_t);
     void init_src_criterion();
     void check_src_criterion(uint64_t);
-    //void check_attack_end();
+    void check_attack_end();
 
     void print_ip_table();
     void print_rev_ip_table();
@@ -111,12 +114,12 @@ private:
     void print_ports();
     void print_flow_stats(std::vector<of13::FlowStats>);
     void print_src_criterion();
-    //void print_attack_end();
+    void print_attack_end();
+    
 public:
     void init(Loader* loader, const Config& config) override;
     void startUp(Loader*);
-signals:
-    void new_port(SwitchConnectionPtr ofconn, of13::PortStatus ps);
+    struct implementation;
 };
 
 }

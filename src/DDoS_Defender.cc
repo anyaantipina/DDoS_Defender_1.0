@@ -1,5 +1,5 @@
 #include "DDoS_Defender.hpp"
-
+#include "OFMessage.hpp"
 #include "PacketParser.hpp"
 
 #include <algorithm>
@@ -7,20 +7,16 @@
 #include <sys/types.h>
 #include "sys/times.h"
 #include "sys/vtimes.h"
-#include <fluid/util/ipaddr.hh>
-
-//FOR TREE TOPOLOGY
-int DDoS_Defender::crit_good_flows = 3;
-float DDoS_Defender::alpha = 0.4;
-float DDoS_Defender::threshold_low = 0.25;
-float DDoS_Defender::threshold_hight = 0.4;
-int DDoS_Defender::THRESHOLD = 20;
-double DDoS_Defender::cpu_util = 0.0;
-int DDoS_Defender::interval = 3;
-double DDoS_Defender::threshold_cpu_util = 25;
-unsigned int DDoS_Defender::hosts_amount = 8;
+#include <sstream>
 
 static clock_t lastCPU, lastSysCPU, lastUserCPU;
+
+static bool ATTACK, BuildDone,  HostsDone;
+static int THRESHOLD, crit_good_flows, interval;
+static float alpha, threshold_low, threshold_hight;
+static float cpu_util, threshold_cpu_util;
+static unsigned int hosts_amount;
+//bool test_interval; //for testing
 
 namespace runos {
 
@@ -57,26 +53,59 @@ float string_to_float(std::string s) {
     return (y1+y2*pow(0.1,x2.length()));
 }
 
+void init_cpu_util(){
+    struct tms timeSample;
+
+    lastCPU = times(&timeSample);
+    lastSysCPU = timeSample.tms_stime;
+    lastUserCPU = timeSample.tms_utime;
+}
+
+void DDoS_Defender::get_cpu_util(){
+    struct tms timeSample;
+    clock_t now;
+    float percent;
+
+    now = times(&timeSample);
+    if (now <= lastCPU || timeSample.tms_stime < lastSysCPU ||
+        timeSample.tms_utime < lastUserCPU){
+        percent = -1.0;
+    }
+    else{
+        percent = (timeSample.tms_stime - lastSysCPU) + (timeSample.tms_utime - lastUserCPU);
+        percent /= (now - lastCPU);
+        percent *= 100;
+    }
+    lastCPU = now;
+    lastSysCPU = timeSample.tms_stime;
+    lastUserCPU = timeSample.tms_utime;
+
+    cpu_util = percent;
+}
+
+
 void DDoS_Defender::init(Loader *loader, const Config &rootConfig){
 
     auto config = config_cd(rootConfig, "ddos-defender");
     crit_good_flows = config_get(config, "crit_good_flows", 3);
-    alpha = string_to_float(config_get(config, "alpha", "0.4").c_str());
-    threshold_low = string_to_float(config_get(config, "threshold_low", "0.1").c_str());
-    threshold_hight = string_to_float(config_get(config, "threshold_hight", "0.4").c_str());
-    THRESHOLD = config_get(config, "THRESHOLD",20);
+    alpha = string_to_float(config_get(config, "alpha", "0.2").c_str());
+    threshold_low = string_to_float(config_get(config, "threshold_low", "0.3").c_str());
+    threshold_hight = string_to_float(config_get(config, "threshold_hight", "0.7").c_str());
+    threshold_cpu_util = string_to_float(config_get(config, "threshold_cpu_util", "80.0").c_str());
+    THRESHOLD = config_get(config, "THRESHOLD",100);
     interval = config_get(config, "interval", 3);
     hosts_amount = config_get(config, "hosts_amount", 8);
 
     //test_interval = false; //FOR TESTING
+
     init_cpu_util();
 
     BuildDone = false;
     HostsDone = false;
     ATTACK = false;
-    Controller *ctrl = Controller::get(loader);
     HostManager *hm = HostManager::get(loader);
-    sm = SwitchManager::get(loader);
+    switch_manager_ = SwitchManager::get(loader);
+    sender_ = OFMsgSender::get(loader);
 
     //ADD HOSTS
     QObject::connect(hm, &HostManager::hostDiscovered, [this](Host* dev){
@@ -84,53 +113,7 @@ void DDoS_Defender::init(Loader *loader, const Config &rootConfig){
         hosts.push_back(host);
     });
 
-    //RESPONSE TO FLOW STATS REPLY
-    oftran = ctrl->registerStaticTransaction(this);
-    QObject::connect(oftran, &OFTransaction::response,
-          [this](SwitchConnectionPtr conn, std::shared_ptr<OFMsgUnion> reply){
-        uint64_t sw_id = conn->dpid();
-        OFMsg* basereply = reply->base();
-        of13::MultipartReply* mpreply = (of13::MultipartReply*)basereply;
-        std::vector<of13::FlowStats> flow_stats =
-                ((of13::MultipartReplyFlow*)mpreply)->flow_stats();
-
-        //FOR TESTING
-        /*if (!test_interval) {
-            add_flow_statistic_from_switch(flow_stats, sw_id);
-            bool done = true;
-            for (auto it : switch_flow_test){
-                if (!it.second.done) {
-                    done = false;
-                    break;
-                }
-            }
-            if (done) {
-                test_interval = true;
-            }
-        }
-        else {
-            print_flow_test();
-            test_interval = false;
-        }*/
-
-        add_src_statistic_from_switch(flow_stats, sw_id);
-
-        bool is_filled = true;
-        sw_response[sw_id] = true;
-        for (auto it : sw_response)
-            if (it.second == false) {
-                is_filled = false;
-            }
-
-        /*if (ATTACK) {
-            check_src_criterion(sw_id);
-            if (is_filled == true) {
-                check_attack_end();
-            }
-            //print_attack_end();
-        }*/
-    });
-
+    //FLOW STATS REPLY
     handler_ = Controller::get(loader)->register_handler(
     [this](of13::PacketIn& pi, OFConnectionPtr ofconn) -> bool
     {
@@ -157,10 +140,10 @@ void DDoS_Defender::init(Loader *loader, const Config &rootConfig){
         std::string str_ip = correct_ip_addr(boost::lexical_cast<std::string>(src_ip));
 
         if (!BuildDone) { // BUILDING IP_BIND_TABLE
-                add_to_RevTable(str_mac, str_ip, in_port, dpid);
-                check_RevTable();
+            add_to_RevTable(str_mac, str_ip, in_port, dpid);
+            check_RevTable();
         }
-        /*else { // INCREASING SRC PACKET_IN COUNTER
+        else { // INCREASING SRC PACKET_IN COUNTER
             std::string key = "MAC " + str_mac + " IP " + str_ip;
             if (src_criterion.find(key) != src_criterion.end()){
                 src_criterion[key].curr_counter += 1;
@@ -172,15 +155,60 @@ void DDoS_Defender::init(Loader *loader, const Config &rootConfig){
                     ATTACK = true;
                 }
             }
-        }*/
+        }
 
         return false;
-    }, -11);
+    }, -30);
+
+    handler_flow_stats_ = Controller::get(loader)->register_handler(
+    [this](of13::MultipartReplyFlow pi, OFConnectionPtr ofconn) -> bool
+    {
+    
+        uint64_t sw_id = ofconn->dpid();
+        std::vector<of13::FlowStats> flow_stats = pi.flow_stats();
+
+        //FOR TESTING
+        /*
+        if (!test_interval) {
+            add_flow_statistic_from_switch(flow_stats, sw_id);
+            bool done = true;
+            for (auto it : switch_flow_test){
+                if (!it.second.done) {
+                    done = false;
+                    break;
+                }
+            }
+            if (done) {
+                test_interval = true;
+            }
+        }
+        else {
+            print_flow_test();
+            test_interval = false;
+        }
+        */
+        add_src_statistic_from_switch(flow_stats, sw_id);
+
+        bool is_filled = true;
+        sw_response[sw_id] = true;
+        for (auto it : sw_response)
+            if (it.second == false) {
+                is_filled = false;
+            }
+
+        if (ATTACK) {
+            check_src_criterion(sw_id);
+            if (is_filled == true) {
+                check_attack_end();
+            }
+            print_attack_end();
+        }
+        return false;
+    }, -30);
 }
 
 void DDoS_Defender::startUp(Loader* ) {
-    LOG(INFO) << "DDoS_Defender::startUp";
-    startTimer(interval*1000);
+    startTimer(interval*2000);
 }
 
 
@@ -202,8 +230,6 @@ void DDoS_Defender::timerEvent(QTimerEvent*) {
         //print_hosts();
         //print_rev_ip_table();
     }
-}
-
 }
 
 void DDoS_Defender::add_to_RevTable(std::string mac, std::string ip, uint32_t port_no, uint64_t sw_id){
@@ -268,7 +294,7 @@ void DDoS_Defender::check_RevTable(){
 void DDoS_Defender::build_IPBindTable(){
     for (auto it_hosts : hosts) {
         for (auto it_rev_table : RevIPBindTable){
-            if (((it_hosts.ip == it_rev_table.second.ip) or (convert_ip_addr(it_hosts.ip) == it_rev_table.second.ip))
+            if (((it_hosts.ip == it_rev_table.second.ip) or (correct_ip_addr(it_hosts.ip) == it_rev_table.second.ip))
                 and (it_hosts.mac == it_rev_table.second.mac) and (it_hosts.ip != "0.0.0.0")){
                 host_info host(it_rev_table.second.mac, it_rev_table.second.ip,
                                it_rev_table.second.switch_port, it_rev_table.second.switch_id);
@@ -299,12 +325,12 @@ void DDoS_Defender::build_ports_set(){
         }
     }
     for (auto it_switch_set : switches){
-        Switch* sw = sm->getSwitch(it_switch_set.first);
-        std::vector<of13::Port> ports = sw->ports();
+        auto sw = switch_manager_->switch_(it_switch_set.first);
+        std::vector<PortPtr> ports = sw->ports();
         for (auto it_ports : ports){
-            if (switches[it_switch_set.first].user.find(it_ports.port_no()) ==
+            if (switches[it_switch_set.first].user.find(it_ports->number()) ==
                     switches[it_switch_set.first].user.end()) {
-                switches[it_switch_set.first].trusted.insert(it_ports.port_no());
+                switches[it_switch_set.first].trusted.insert(it_ports->number());
             }
         }
     }
@@ -334,6 +360,7 @@ void DDoS_Defender::add_src_statistic_from_switch(std::vector<of13::FlowStats> f
         }
     }
     //ADD NEW STATISTIC
+    
     for (auto it : flow_stats){
         of13::FlowStats *flow1 = static_cast<of13::FlowStats *>(&it);
         of13::Match match = flow1->match();
@@ -341,7 +368,7 @@ void DDoS_Defender::add_src_statistic_from_switch(std::vector<of13::FlowStats> f
         if (match.eth_src())
             mac = match.eth_src()->value().to_string();
         if (match.ipv4_src()) {
-            ip = AppObject::uint32_t_ip_to_string(match.ipv4_src()->value().getIPv4());
+            ip = boost::lexical_cast<std::string>(ipv4addr(match.ipv4_src()->value().getIPv4()));
         }
         std::string key = "MAC " + mac + " IP " + ip;
         if (src_criterion.find(key) != src_criterion.end()){
@@ -351,26 +378,16 @@ void DDoS_Defender::add_src_statistic_from_switch(std::vector<of13::FlowStats> f
             }
         }
     }
+    
 }
 
 void DDoS_Defender::send_init_flowmods(){
-    const auto ofb_in_port = oxm::in_port();
-    const auto ofb_eth_type = oxm::eth_type();
-    const auto ofb_ipv4_src = oxm::ipv4_src();
-    const auto ofb_eth_src = oxm::eth_src();
 
     for (auto it_switch : switches){
-        Switch* switch_ = sm->getSwitch(it_switch.first);
-
         //DROP ACTIONS
+        
         for (auto host_port : it_switch.second.user){
-            uint16_t priority = 0;
-            priority += host_port;
-            oxm::field_set m_match1, m_match2;
-            m_match1.modify(ofb_in_port == host_port);
-            m_match1.modify(ofb_eth_type == 0x0800);
-            m_match2.modify(ofb_in_port == host_port);
-            m_match2.modify(ofb_eth_type == 0x0806);
+            uint16_t priority = 2;
 
             of13::FlowMod fm1, fm2;
             fm1.command(of13::OFPFC_ADD); fm2.command(of13::OFPFC_ADD);
@@ -381,105 +398,98 @@ void DDoS_Defender::send_init_flowmods(){
             fm1.cookie(0x0); fm2.cookie(0x0);
             fm1.idle_timeout(0); fm2.idle_timeout(0);
             fm1.hard_timeout(0); fm2.hard_timeout(0);
-            fm1.flags( of13::OFPFF_CHECK_OVERLAP | of13::OFPFF_SEND_FLOW_REM );
-            fm2.flags( of13::OFPFF_CHECK_OVERLAP | of13::OFPFF_SEND_FLOW_REM );
-            fm1.match(make_of_match(m_match1)); fm2.match(make_of_match(m_match2));
-            switch_->connection()->send(fm1);
-            switch_->connection()->send(fm2);
+            fm1.flags( of13::OFPFF_SEND_FLOW_REM );
+            fm2.flags( of13::OFPFF_SEND_FLOW_REM );
+            fm1.add_oxm_field(new of13::EthType(0x0800));
+            fm2.add_oxm_field(new of13::EthType(0x0806));
+            fm1.add_oxm_field(new of13::InPort(host_port));
+            fm2.add_oxm_field(new of13::InPort(host_port));
+            sender_->send(it_switch.first, fm1);
+            sender_->send(it_switch.first, fm2);
         }
-
+        
         //GOTOTABLE ACTIONS FOR TRUSTED PORTS
         for (auto trust_port : it_switch.second.trusted){
-            oxm::field_set m_match;
-            m_match.modify(ofb_in_port == trust_port);
-
             of13::FlowMod fm;
-            fm.command(of13::OFPFC_ADD);;
+            fm.command(of13::OFPFC_ADD);
             fm.xid(0);
             fm.buffer_id(OFP_NO_BUFFER);
             fm.table_id(0);
-            fm.priority(1);
+            fm.priority(2);
             fm.cookie(0x0);
             fm.idle_timeout(0);
             fm.hard_timeout(0);
             fm.flags( of13::OFPFF_CHECK_OVERLAP | of13::OFPFF_SEND_FLOW_REM );
-            fm.match(make_of_match(m_match));
+            fm.add_oxm_field(new of13::InPort(trust_port));
             of13::GoToTable go_to_table(1);
             fm.add_instruction(go_to_table);
-            switch_->connection()->send(fm);
+            sender_->send(it_switch.first, fm);
         }
     }
 
     //GOTOTABLE ACTIONS
     for (auto it_BindTable : IPBindTable) {
-        Switch* switch_ = sm->getSwitch(it_BindTable.second.switch_id);
-        ethaddr eth_src(it_BindTable.second.mac);
-        //IPv4Addr ipv4_src(it_BindTable.second.ip);
-        uint16_t priority = 20;
-        priority += it_BindTable.second.switch_port;
-
-        oxm::field_set m_match1, m_match2;
-        m_match1.modify(ofb_in_port == it_BindTable.second.switch_port);
-        m_match1.modify(ofb_eth_type == 0x0800);
-        m_match1.modify(ofb_eth_src == eth_src);
-        m_match1.modify(ofb_ipv4_src == it_BindTable.second.ip);
-        m_match2.modify(ofb_in_port == it_BindTable.second.switch_port);
-        m_match2.modify(ofb_eth_type == 0x0806);
-        m_match2.modify(ofb_eth_src == eth_src);
+        uint16_t priority = 3;
 
         of13::FlowMod fm1, fm2;
+        std::stringstream ss;
         fm1.command(of13::OFPFC_ADD); fm2.command(of13::OFPFC_ADD);
         fm1.xid(0); fm2.xid(0);
         fm1.buffer_id(OFP_NO_BUFFER); fm2.buffer_id(OFP_NO_BUFFER);
         fm1.table_id(0); fm2.table_id(0);
         fm1.priority(priority); fm2.priority(priority);
         fm1.cookie(0x0); fm2.cookie(0x0);
-        fm1.idle_timeout(0); fm2.idle_timeout(0);
-        fm1.hard_timeout(0); fm2.hard_timeout(0);
-        fm1.flags( of13::OFPFF_CHECK_OVERLAP | of13::OFPFF_SEND_FLOW_REM );
-        fm2.flags( of13::OFPFF_CHECK_OVERLAP | of13::OFPFF_SEND_FLOW_REM );
-        fm1.match(make_of_match(m_match1)); fm2.match(make_of_match(m_match2));
+        fm1.idle_timeout(uint64_t(600)); fm2.idle_timeout(uint64_t(600));
+        fm1.hard_timeout(uint64_t(0)); fm2.hard_timeout(uint64_t(0));
+        fm1.flags( of13::OFPFF_SEND_FLOW_REM ); fm2.flags( of13::OFPFF_SEND_FLOW_REM );
+        fm1.add_oxm_field(new of13::EthType(0x0800)); fm2.add_oxm_field(new of13::EthType(0x0806));
+        fm1.add_oxm_field(new of13::InPort(it_BindTable.second.switch_port));
+        fm2.add_oxm_field(new of13::InPort(it_BindTable.second.switch_port));
+
+        ethaddr eth_src(it_BindTable.second.mac);
+        ss.str(std::string());
+        ss.clear();
+        ss << eth_src;
+        fm1.add_oxm_field(new of13::EthSrc{fluid_msg::EthAddress(ss.str())});
+        fm2.add_oxm_field(new of13::EthSrc{fluid_msg::EthAddress (ss.str())});
+
+        ipv4addr ipv4_src(convert(it_BindTable.second.ip).first);
+        ss.str(std::string());
+        ss.clear();
+        ss << ipv4_src;
+        fm1.add_oxm_field(new of13::IPv4Src{fluid_msg::IPAddress (ss.str())});
         of13::GoToTable go_to_table(1);
         fm1.add_instruction(go_to_table);
         fm2.add_instruction(go_to_table);
-        switch_->connection()->send(fm1);
-        switch_->connection()->send(fm2);
+        sender_->send(it_BindTable.second.switch_id, fm1);
+        sender_->send(it_BindTable.second.switch_id, fm2);
     }
+    
 }
 
-void init_cpu_util(){
-    struct tms timeSample;
+void DDoS_Defender::send_drop_flowmod(uint64_t sw_id, uint32_t port_no){
 
-    lastCPU = times(&timeSample);
-    lastSysCPU = timeSample.tms_stime;
-    lastUserCPU = timeSample.tms_utime;
-}
-
-void DDoS_Defender::get_cpu_util(){
-    struct tms timeSample;
-    clock_t now;
-    double percent;
-
-    now = times(&timeSample);
-    if (now <= lastCPU || timeSample.tms_stime < lastSysCPU ||
-        timeSample.tms_utime < lastUserCPU){
-        percent = -1.0;
-    }
-    else{
-        percent = (timeSample.tms_stime - lastSysCPU) + (timeSample.tms_utime - lastUserCPU);
-        percent /= (now - lastCPU);
-        percent *= 100;
-    }
-    lastCPU = now;
-    lastSysCPU = timeSample.tms_stime;
-    lastUserCPU = timeSample.tms_utime;
-
-    cpu_util = percent;
+    of13::FlowMod fm1, fm2;
+    fm1.command(of13::OFPFC_ADD); fm2.command(of13::OFPFC_ADD);
+    fm1.xid(0); fm2.xid(0);
+    fm1.buffer_id(OFP_NO_BUFFER); fm2.buffer_id(OFP_NO_BUFFER);
+    fm1.table_id(0); fm2.table_id(0);
+    fm1.priority(40); fm2.priority(40);
+    fm1.cookie(0x0); fm2.cookie(0x0);
+    fm1.idle_timeout(0); fm2.idle_timeout(0);
+    fm1.hard_timeout(0); fm2.hard_timeout(0);
+    fm1.flags( of13::OFPFF_CHECK_OVERLAP | of13::OFPFF_SEND_FLOW_REM );
+    fm2.flags( of13::OFPFF_CHECK_OVERLAP | of13::OFPFF_SEND_FLOW_REM );
+    fm1.add_oxm_field(new of13::EthType(0x0800));
+    fm2.add_oxm_field(new of13::EthType(0x0806));
+    fm1.add_oxm_field(new of13::InPort(port_no));
+    fm2.add_oxm_field(new of13::InPort(port_no));
+    sender_->send(sw_id, fm1);
+    sender_->send(sw_id, fm2);
 }
 
 void DDoS_Defender::get_flow_stats(){
     for (auto it : switches){
-        Switch* sw = sm->getSwitch(it.first);
         of13::MultipartRequestFlow mprf;
         mprf.table_id(of13::OFPTT_ALL);
         mprf.out_port(of13::OFPP_ANY);
@@ -487,7 +497,7 @@ void DDoS_Defender::get_flow_stats(){
         mprf.cookie(0x0);
         mprf.cookie_mask(0x0);
         mprf.flags(0);
-        oftran->request(sw->connection(),  mprf);
+        sender_->send(it.first, mprf);
     }
     bool is_filled = true;
     for (auto it : sw_response) {
@@ -502,6 +512,145 @@ void DDoS_Defender::get_flow_stats(){
         }
     }
 }
+
+void DDoS_Defender::check_src_criterion(uint64_t sw_id){
+    for (auto it : src_criterion){
+        if (src_criterion[it.first].host.switch_id == sw_id) {
+             std::string key = it.first;
+            if (src_criterion[key].type == "INFECTED"){
+                continue;
+            }
+            if (src_criterion[key].all_flows != 0) {
+                src_criterion[key].crit = src_criterion[key].good_flows / src_criterion[key].all_flows;
+            }
+            else {
+                src_criterion[key].crit = threshold_hight;
+            }
+            float curr_score;
+            if (src_criterion[key].prev_counter != 0) {
+                curr_score = src_criterion[key].crit / src_criterion[key].prev_counter;
+            }
+            else {
+                curr_score = threshold_hight;
+            }
+            curr_score = (1 - alpha) * curr_score + alpha*it.second.prev_score;
+            src_criterion[key].prev_score = curr_score;
+            if ((curr_score < threshold_low)) {
+                LOG(INFO) << key << " (threshold)=>modif_curr_score " << curr_score << " INFECTED";
+                //DELETE FROM USER GROUP AND ADD TO INFECTED
+                if (src_criterion[key].type == "USER") {
+                    switches[it.second.host.switch_id].user.erase(it.second.host.switch_port);
+                }
+                else if (src_criterion[key].type == "AMBIGUOUS") {
+                    switches[it.second.host.switch_id].ambiguous.erase(it.second.host.switch_port);
+                }
+                switches[it.second.host.switch_id].infected.insert(it.second.host.switch_port);
+                src_criterion[key].type = "INFECTED";
+                //DROP PACKETS FROM SRC
+                send_drop_flowmod(it.second.host.switch_id, it.second.host.switch_port);
+            }
+            else if ((curr_score < threshold_hight)
+                    && (src_criterion[key].type != "AMBIGUOUS")) {
+                //DELETE FROM USER GROUP
+                if (src_criterion[key].type == "USER") {
+                    switches[it.second.host.switch_id].user.erase(it.second.host.switch_port);
+                }
+                if (cpu_util > threshold_cpu_util) {
+                    LOG(INFO) << key << " (cpu_util=" << cpu_util << ", threshold=" << threshold_cpu_util << ")=>modif_curr_score " << curr_score << " INFECTED";
+                    if (src_criterion[key].type == "AMBIGUOUS") {
+                        switches[it.second.host.switch_id].ambiguous.erase(it.second.host.switch_port);
+                    }
+                    //ADD TO INFECTED
+                    src_criterion[key].type = "INFECTED";
+                    switches[it.second.host.switch_id].infected.insert(it.second.host.switch_port);
+                    //DROP PACKETS FROM SRC
+                    send_drop_flowmod(it.second.host.switch_id, it.second.host.switch_port);
+                }
+                else {
+                    LOG(INFO) << key << " (cpu_util=" << cpu_util << ", threshold=" << threshold_cpu_util << ")=>modif_curr_score " << curr_score << " AMBIGUOUS";
+                    //ADD TO AMBIGUOUS
+                    switches[it.second.host.switch_id].ambiguous.insert(it.second.host.switch_port);
+                    src_criterion[key].type = "AMBIGUOUS";
+                }
+            }
+            else if ((curr_score >= threshold_hight)
+                     && (src_criterion[key].type != "USER")) {
+                LOG(INFO) << key << " modif_curr_score " << curr_score << " USER";
+                //DELETE FROM ANBIGUOUS GROUP AND ADD TO USER
+                switches[it.second.host.switch_id].ambiguous.erase(it.second.host.switch_port);
+                switches[it.second.host.switch_id].user.insert(it.second.host.switch_port);
+                src_criterion[key].type = "USER";
+            }
+        }
+    }
+}
+
+void DDoS_Defender::check_attack_end(){
+    bool end=true;
+    for (auto it : attack_end){
+        if ((it.second.curr_counter > THRESHOLD) || (it.second.prev_counter > THRESHOLD)) {
+            end = false;
+            break;
+        }
+    }
+    if (end) {
+        ATTACK = false;
+        LOG(INFO) << "END OF THE ATTACK";
+        print_ports();
+    }
+}
+
+//FOR TESTING
+/*
+flow_stat::flow_stat(){
+    this->inf_count=0;
+    this->usr_count=0;
+    this->stats = {};
+    this->done = false;
+}
+
+void DDoS_Defender::add_flow_statistic_from_switch(std::vector<of13::FlowStats> flow_stats, uint64_t sw_id){
+    switch_flow_test[sw_id].inf_count = 0;
+    switch_flow_test[sw_id].usr_count = 0;
+    for (auto flow : flow_stats){
+        std::string mac, ip;
+        if (flow.match().eth_src())
+            mac = flow.match().eth_src()->value().to_string();
+        for (auto it : src_criterion) {
+            if (it.second.host.mac == mac) {
+                if (it.second.type == "INFECTED")
+                    switch_flow_test[sw_id].inf_count+=1;
+                else if (it.second.type == "USER")
+                    switch_flow_test[sw_id].usr_count+=1;
+            }
+        }
+    }
+    switch_flow_test[sw_id].stats = flow_stats;
+    switch_flow_test[sw_id].done = true;
+    int index = 0;
+    for (auto flow : flow_stats){
+        LOG(INFO) << "flow " << index
+                  << ", table id: " << unsigned(flow.table_id())
+                  << ", priority: " << flow.priority()
+                  << " idle_to: " << flow.idle_timeout()
+                  << ", hard_to: " << flow.hard_timeout()
+                  << ", packet count: " << flow.packet_count();
+        std::string eth_src = "", ip_src = "", eth_dst = "", ip_dst = "";
+        uint32_t in_port = 0;
+        
+        if (flow.match().eth_src()) eth_src = flow.match().eth_src()->value().to_string();
+        if (flow.match().ipv4_src()) ip_src = boost::lexical_cast<std::string>(
+                                            ipv4addr(flow.match().ipv4_src()->value().getIPv4()));
+        if (flow.match().eth_dst()) eth_dst = flow.match().eth_dst()->value().to_string();
+        if (flow.match().ipv4_dst()) ip_dst = boost::lexical_cast<std::string>(
+                                            ipv4addr(flow.match().ipv4_dst()->value().getIPv4()));
+        if (flow.match().in_port()) in_port = flow.match().in_port()->value();
+        LOG(INFO) << "      MACSrc=" << eth_src << " IPSrc=" << ip_src << " InPort=" << in_port
+                  << " MACDst=" << eth_dst << " IPDst=" << ip_dst << std::endl;
+        index++;
+    }
+}
+*/
 
 //PRINTING FUNCTIONS
 
@@ -561,17 +710,24 @@ void DDoS_Defender::print_flow_stats(std::vector<of13::FlowStats> flow_stats){
         of13::FlowStats *flow1 = static_cast<of13::FlowStats *>(&it);
         of13::Match match = flow1->match();
         std::string mac, ip;
-        if (match.eth_src())
-            mac = match.eth_src()->value().to_string();
-        else continue;
-        if (match.ipv4_src()) {
-            ip = AppObject::uint32_t_ip_to_string(match.ipv4_src()->value().getIPv4());
-        }
         LOG(INFO) << "flow " << index << " MAC " << mac << " IP " << ip
                   << ", table id: " << unsigned(it.table_id())
-                  << "idle_to: " << it.idle_timeout()
+                  << " idle_to: " << it.idle_timeout()
                   << ", hard_to: " << it.hard_timeout()
                   << ", packet count: " << it.packet_count();
+        if (match.eth_type()) {
+            if (match.eth_type()->value() == 0x0800) {
+                std::string eth_src = "", ip_src = "", eth_dst = "", ip_dst = "";
+                uint32_t in_port = 0;
+                if (match.eth_src()) eth_src = match.eth_src()->value().to_string();
+                if (match.ipv4_src()) ip_src = boost::lexical_cast<std::string>(ipv4addr(match.ipv4_src()->value().getIPv4()));
+                if (match.eth_dst()) eth_dst = match.eth_dst()->value().to_string();
+                if (match.ipv4_dst()) ip_dst = boost::lexical_cast<std::string>(ipv4addr(match.ipv4_dst()->value().getIPv4()));
+                if (match.in_port()) in_port = match.in_port()->value();
+                LOG(INFO) << "      MACSrc=" << eth_src << " IPSrc=" << ip_src << " InPort=" << in_port
+                          << " MACDst=" << eth_dst << " IPDst=" << ip_dst << std::endl;
+            }
+        }
         index++;
     }
 }
@@ -584,6 +740,13 @@ void DDoS_Defender::print_src_criterion(){
                   << ", curr = " << it.second.curr_counter << "), "
                   << " crit " << it.second.crit
                   << " score " << it.second.prev_score;
+    }
+}
+
+void DDoS_Defender::print_attack_end(){
+    LOG(INFO) << "Hosts_Crit (size = " << src_criterion.size() <<") :";
+    for (auto it : attack_end){
+        LOG(INFO) << it.first << " prev_counter " << it.second.prev_counter << " curr_counter " << it.second.curr_counter;
     }
 }
 
@@ -616,8 +779,8 @@ score::score(){
     this->curr_counter = 1;
     this->good_flows = 1;
     this->all_flows = 1;
-    this->crit = DDoS_Defender::threshold_hight;
-    this->prev_score = DDoS_Defender::threshold_hight;
+    this->crit = threshold_hight;
+    this->prev_score = threshold_hight;
 }
 
 counters::counters(){
@@ -625,3 +788,4 @@ counters::counters(){
     this->prev_counter = 0;
 }
 
+}
