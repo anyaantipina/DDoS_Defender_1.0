@@ -1,5 +1,4 @@
 #include "DDoS_Defender.hpp"
-#include "OFMessage.hpp"
 #include "PacketParser.hpp"
 
 #include <algorithm>
@@ -8,19 +7,24 @@
 #include "sys/times.h"
 #include "sys/vtimes.h"
 #include <sstream>
+#include <stdexcept>
+#include <tins/ip.h>
+#include <cmath>
 
 static clock_t lastCPU, lastSysCPU, lastUserCPU;
 
-static bool ATTACK, BuildDone,  HostsDone;
-static int THRESHOLD, crit_good_flows, interval;
+static bool ATTACK, CLEAR;
+static int omega;
+static int tau, common_t, big_t;
 static float alpha, threshold_low, threshold_hight;
 static float cpu_util, threshold_cpu_util;
-static unsigned int hosts_amount;
-//bool test_interval; //for testing
+int current_time, sw_response_number;
+int commonPNF;
+uint64_t numberClearTables;
 
 namespace runos {
 
-REGISTER_APPLICATION(DDoS_Defender, {"controller", "host-manager", ""})
+REGISTER_APPLICATION(DDoS_Defender, {"controller", "host-manager", "switch-manager",  "link-discovery", "dhcp-server", ""})
 
 std::string correct_ip_addr(std::string ip){
     std::vector<std::string> fragms;
@@ -83,37 +87,603 @@ void DDoS_Defender::get_cpu_util(){
     cpu_util = percent;
 }
 
+DDoS_Defender::BTinfo::BTinfo(ethaddr mac, ipv4addr ip, ipv4addr oldip, 
+                                uint64_t dpid, uint32_t port, bool status=false, 
+                                bool host=false): 
+                MAC(mac), IP(ip), oldIP(oldip), DPID(dpid), PortNo(port), Status(status), isHost(host) {};
+
+
+std::string DDoS_Defender::BTinfo::getStrMAC() {
+    return boost::lexical_cast<std::string>(MAC);
+}
+
+std::string DDoS_Defender::BTinfo::getStrIP() {
+    return boost::lexical_cast<std::string>(IP);
+}
+
+controlFilterModule::SWobj::SWobj(bool status=false, bool edge=false): Status(status), isEdge(edge) {};
+
+bool controlFilterModule::SWobj::isAllPortsOff() {
+    bool allOff = true;
+    for (auto it : ports.trusted) {
+        if (it.second == true) {
+            allOff = false;
+            break;
+        }
+    }
+    for (auto it : ports.users) {
+        if (it.second == true) {
+            allOff = false;
+            break;
+        }
+    }
+    for (auto it : ports.unknown) {
+        if (it.second == true) {
+            allOff = false;
+            break;
+        }
+    }
+    return allOff;
+}
+
+collectStatsModule::statsPort::statsPort() {
+    gamma = 0;
+    gamma_per_tau = 0;
+    drop = 0;
+    diff_drop = 0;
+    score = threshold_hight;
+    PNF = commonPNF;
+    type = USR;
+}
+
+std::string collectStatsModule::statsPort::whatType(){
+    switch (type) {
+        case USR : return "USR";
+        case INF : return "INF";
+        case AMB : return "AMB";
+    }
+    return "";
+}
+
+collectStatsModule::statsSW::statsSW() {
+    beta = 0;
+    lambda = 0;
+    alpha = omega;
+}
+
+collectStatsModule::collectStatsModule() {
+    isAlphaExceed = false;
+    numberSW = 0;
+    sumBeta = 0;
+    sumLambda = 0;
+}
+
+DDoS_Defender::DDoS_Defender() {
+    CFModPtr = std::make_unique<controlFilterModule>();
+    CSModPtr = std::make_unique<collectStatsModule>();
+}
+
+void DDoS_Defender::onHostDiscovered(Host* dev) {
+    //host_info host(dev->mac(), dev->ip(), dev->switchPort(), dev->switchID());
+    //CFModPtr->hosts.push_back(host);
+    if (dev->mac() != "00:00:00:00:00:00") {
+        if (dev->ip() == "0.0.0.0") {
+            BTinfo info(ethaddr(dev->mac()), convert("0.0.0.0").first, 
+                        convert("0.0.0.0").first, dev->switchID(), dev->switchPort());
+            BindingTable_.emplace(dev->mac(), info);
+            auto it = CFModPtr->switches_.find(dev->switchID());
+            if (it != CFModPtr->switches_.end()) {
+                if (CFModPtr->switches_[dev->switchID()].Status == false) {
+                    LOG(INFO) << "the message came from a switch " << dev->switchID() << " that is OFF";
+                }
+                auto itPort = it->second.ports.unknown.find(dev->switchPort());
+                if (itPort != it->second.ports.unknown.end()) {
+                    if (itPort->second == false) {
+                        LOG(INFO) << "the message came from a switch " << dev->switchID() << " from port " 
+                                        << dev->switchPort() << " that is OFF";
+                    }
+                }
+                else {
+                    itPort = it->second.ports.trusted.find(dev->switchPort());
+                    if (itPort != it->second.ports.trusted.end()) {
+                        LOG(INFO) << "the message from unknown IP came from a switch " << dev->switchID() << " from port " 
+                                            << dev->switchPort() << " that is TRUSTED";
+                    }
+                    else {
+                        itPort = it->second.ports.users.find(dev->switchPort());
+                        if (itPort != it->second.ports.users.end()) {
+                            LOG(INFO) << "the message from unknown IP came from a switch " << dev->switchID() << " from port " 
+                                                << dev->switchPort() << " that is USERS";
+                        }
+                    }
+                }
+            }
+            
+        }
+        
+        else {
+            BTinfo info(ethaddr(dev->mac()), convert(correct_ip_addr(dev->ip())).first,
+                                convert(correct_ip_addr("0.0.0.0")).first, dev->switchID(), dev->switchPort(), true, true);
+            BindingTable_.emplace(dev->mac(), info);
+            auto it = CFModPtr->switches_.find(dev->switchID());
+            if (it != CFModPtr->switches_.end()) {
+                //LOG(INFO) << "NEW NODE " << dev->mac() << " : " 
+                //            << convert(correct_ip_addr(dev->ip())).first << " IS HOST and ON";
+                if (CFModPtr->switches_[dev->switchID()].Status == false) {
+                    LOG(INFO) << "the message came from a switch " << dev->switchID() << " that is OFF";
+                }
+                auto itPort = it->second.ports.users.find(dev->switchPort());
+                if (itPort != it->second.ports.users.end()) {
+                    if (itPort->second == false) {
+                        LOG(INFO) << "the message came from a switch " << dev->switchID() << " from port " 
+                                        << dev->switchPort() << " that is OFF";
+                    }
+                }
+                else {
+                    itPort = it->second.ports.trusted.find(dev->switchPort());
+                    if (itPort != it->second.ports.trusted.end()) {
+                        if (itPort->second == false) {
+                            LOG(INFO) << "the message came from a switch " << dev->switchID() << " from port " 
+                                            << dev->switchPort() << " that is OFF";
+                        }
+                        CFModPtr->switches_[dev->switchID()].ports.users.emplace(dev->switchPort(), true);
+                        CFModPtr->switches_[dev->switchID()].ports.trusted.erase(dev->switchPort());
+                        std::string sw_port = boost::lexical_cast<std::string>(dev->switchID()) + 
+                                                boost::lexical_cast<std::string>(dev->switchPort());
+                        CFModPtr->sw_port_to_MAC.emplace(sw_port,dev->mac());
+
+                        collectStatsModule::statsPort port;
+                        CSModPtr->stats_[dev->switchID()].ports.emplace(dev->switchPort(), port);
+                        //LOG(INFO) << "ON SWITCH " << dev->switchID() << " TRUSTED PORT " << dev->switchPort() << " COME USERS";
+                    }
+                    else {
+                        itPort = it->second.ports.unknown.find(dev->switchPort());
+                        if (itPort != it->second.ports.unknown.end()) {
+                            if (itPort->second == false) {
+                                LOG(INFO) << "the message came from a switch " << dev->switchID() << " from port " 
+                                            << dev->switchPort() << " that is OFF";
+                            }
+                            CFModPtr->switches_[dev->switchID()].ports.users.emplace(dev->switchPort(),true);
+                            CFModPtr->switches_[dev->switchID()].ports.unknown.erase(dev->switchPort());
+                            std::string sw_port = boost::lexical_cast<std::string>(dev->switchID()) + 
+                                                    boost::lexical_cast<std::string>(dev->switchPort());
+                            CFModPtr->sw_port_to_MAC.emplace(sw_port,dev->mac());
+                            collectStatsModule::statsPort port;
+                            CSModPtr->stats_[dev->switchID()].ports.emplace(dev->switchPort(), port);
+                            //LOG(INFO) << "ON SWITCH " << dev->switchID() << " UNKNOWN PORT " << dev->switchPort() << " COME USERS";
+                        }
+                    }
+                }
+                if (CFModPtr->switches_[dev->switchID()].isEdge == false) {
+                    CFModPtr->switches_[dev->switchID()].isEdge = true;
+                    //LOG(INFO) << "SWITCH " << dev->switchID() << " is EDGE";
+                    CSModPtr->numberSW++;
+
+                    collectStatsModule::statsSW ssw;
+                    CSModPtr->stats_.emplace(dev->switchID(), ssw);
+                    //LOG(INFO) << "NUMBER OF EDGE SWITCHES IS " << CSModPtr->numberSW;
+                    CSModPtr->recount();
+                }
+            }
+            else {
+                LOG(INFO) << "the message came from a switch " << dev->switchID() << " that is not in switches_";
+            }
+            CFModPtr->add_filtered_flows(sender_, dev->mac(), correct_ip_addr(dev->ip()), dev->switchID(), dev->switchPort());
+        }
+    }
+}
+
+void DDoS_Defender::onAddrChanged(Client* dev) {
+    std::string MAC = boost::lexical_cast<std::string>(dev->MAC);
+    std::string newIP = (Tins::IPv4Address(htonl(dev->IP))).to_string();
+    auto itBT = BindingTable_.find(MAC);
+    if ((itBT != BindingTable_.end()) && (MAC != "00:00:00:00:00:00")) {
+        if (itBT->second.IP != convert(newIP).first) { 
+            //LOG(INFO) << "NODE " << MAC << " : " << newIP << "(" << itBT->second.getStrIP() << ") IS HOST and ON";
+            auto it = CFModPtr->switches_.find(itBT->second.DPID);
+            if (it != CFModPtr->switches_.end()) {
+                if (CFModPtr->switches_[itBT->second.DPID].Status == false) {
+                    LOG(INFO) << "the message came from a switch " << itBT->second.DPID << " that is OFF";
+                }
+                auto itPort = it->second.ports.users.find(itBT->second.PortNo);
+                if (itPort != it->second.ports.users.end()) {
+                    if (itPort->second == false) {
+                        LOG(INFO) << "the message came from a switch " << itBT->second.DPID << " from port " 
+                                        << itBT->second.PortNo << " that is OFF";
+                    }
+                }
+                else {
+                    itPort = it->second.ports.trusted.find(itBT->second.PortNo);
+                    if (itPort != it->second.ports.trusted.end()) {
+                        if (itPort->second == false) {
+                            LOG(INFO) << "the message came from a switch " << itBT->second.DPID << " from port " 
+                                            << itBT->second.PortNo << " that is OFF";
+                        }
+                        CFModPtr->switches_[itBT->second.DPID].ports.users.emplace(itBT->second.PortNo,true);
+                        CFModPtr->switches_[itBT->second.DPID].ports.trusted.erase(itBT->second.PortNo);
+                        std::string sw_port = boost::lexical_cast<std::string>(itBT->second.DPID) + 
+                                                boost::lexical_cast<std::string>(itBT->second.PortNo);
+                        CFModPtr->sw_port_to_MAC.emplace(sw_port,MAC);
+                        collectStatsModule::statsPort port;
+                        CSModPtr->stats_[itBT->second.DPID].ports.emplace(itBT->second.PortNo, port);
+                        //LOG(INFO) << "ON SWITCH " << itBT->second.DPID << " TRUSTED PORT " << itBT->second.PortNo << " COME USERS";
+                    }
+                    else {
+                        itPort = it->second.ports.unknown.find(itBT->second.PortNo);
+                        if (itPort != it->second.ports.unknown.end()) {
+                            if (itPort->second == false) {
+                                LOG(INFO) <<  "the message came from a switch " << itBT->second.DPID << " from port " 
+                                                << itBT->second.PortNo << " that is OFF";
+                            }
+                            CFModPtr->switches_[itBT->second.DPID].ports.users.emplace(itBT->second.PortNo,true);
+                            CFModPtr->switches_[itBT->second.DPID].ports.unknown.erase(itBT->second.PortNo);
+                            std::string sw_port = boost::lexical_cast<std::string>(itBT->second.DPID) + 
+                                                    boost::lexical_cast<std::string>(itBT->second.PortNo);
+                            CFModPtr->sw_port_to_MAC.emplace(sw_port,MAC);
+                            collectStatsModule::statsPort port;
+                            CSModPtr->stats_[itBT->second.DPID].ports.emplace(itBT->second.PortNo, port);
+                            //LOG(INFO) << "ON SWITCH " << itBT->second.DPID << " UNKNOWN PORT " << itBT->second.PortNo << " COME USERS";
+                        }
+                    }
+                }
+                if (CFModPtr->switches_[itBT->second.DPID].isEdge == false) {
+                    CFModPtr->switches_[itBT->second.DPID].isEdge = true;
+                    //LOG(INFO) << "SWITCH " << itBT->second.DPID << " is EDGE";
+                    CSModPtr->numberSW++;
+
+                    collectStatsModule::statsSW ssw;
+                    CSModPtr->stats_.emplace(itBT->second.DPID, ssw);
+                    //LOG(INFO) << "NUMBER OF EDGE SWITCHES IS " << CSModPtr->numberSW;
+                    CSModPtr->recount();
+                }
+            }
+            else {
+                LOG(INFO) << "the message came from a switch " << itBT->second.DPID << " that is not in switches_";
+            }
+            CFModPtr->delete_old_flows(sender_, MAC, itBT->second.getStrIP(), itBT->second.DPID, itBT->second.PortNo);
+            CFModPtr->add_filtered_flows(sender_, MAC, newIP, itBT->second.DPID, itBT->second.PortNo);
+            itBT->second.IP = convert(newIP).first;
+            itBT->second.Status = true;
+            itBT->second.isHost = true;
+        }
+    }
+    else {
+        LOG(INFO) << "the message came from host " << MAC << " that is not in BindindTable";
+    }
+}
+
+void DDoS_Defender::onSwitchUp(SwitchPtr dev) {
+    auto itSW = CFModPtr->switches_.find(dev->dpid());
+    if (itSW != CFModPtr->switches_.end()) {
+        if ((CFModPtr->switches_[dev->dpid()]).Status == false) {
+            (CFModPtr->switches_[dev->dpid()]).Status = true;
+            //LOG(INFO) << "SWITCH " << dev->dpid() << " UP";
+            if (CFModPtr->switches_[dev->dpid()].isEdge == true) {
+                CSModPtr->numberSW++;
+                //LOG(INFO) << "NUMBER OF EDGE SWITCHES IS " << CSModPtr->numberSW;
+                CSModPtr->recount();
+            }
+        }
+    }
+    else {
+        controlFilterModule::SWobj sw(true,false);
+        CFModPtr->switches_.emplace(dev->dpid(), sw);
+        //LOG(INFO) << "SWITCH " << dev->dpid() << " UP";
+    }
+    if (BindingTable_.size() != 0) {
+        for (auto it = BindingTable_.begin(); it != BindingTable_.end(); it++) {
+            if (it->second.DPID == dev->dpid()) {
+                it->second.Status = true;
+            }
+        }
+    }
+}
+
+void DDoS_Defender::onSwitchDown(SwitchPtr dev) {
+    auto itSW = CFModPtr->switches_.find(dev->dpid());
+    if ((itSW != CFModPtr->switches_.end()) && itSW->second.Status) {
+        itSW->second.Status = false;
+        //LOG(INFO) << "SWITCH " << dev->dpid() << " DOWN";
+        if (itSW->second.isEdge) {
+            CSModPtr->numberSW--;
+            CSModPtr->recount();
+        }
+    }
+    else {
+        LOG(INFO) << "the message came from a switch " << dev->dpid() << " that is not in switches_";
+    }
+
+    if (BindingTable_.size() != 0) {
+        for (auto it = BindingTable_.begin(); it != BindingTable_.end(); it++) {
+            if (it->second.DPID == dev->dpid()) {
+                it->second.Status = false;
+            }
+        }
+    }
+}
+
+void DDoS_Defender::onLinkUp(PortPtr dev) {
+    auto itSW = CFModPtr->switches_.find(dev->switch_()->dpid());
+    if (itSW != CFModPtr->switches_.end()) {
+        auto itPort = itSW->second.ports.trusted.find(dev->number());
+        if (itPort != itSW->second.ports.trusted.end()) {
+            if (itSW->second.Status == false) {
+                itSW->second.Status = true;
+                //LOG(INFO) << "SWITCH " << dev->switch_()->dpid() << " UP";
+                if (CFModPtr->switches_[dev->switch_()->dpid()].isEdge == true) {
+                    CSModPtr->numberSW++;
+                    //LOG(INFO) << "NUMBER OF EDGE SWITCHES IS " << CSModPtr->numberSW;
+                    CSModPtr->recount();
+                }
+            }
+            itPort->second = true;
+            //LOG(INFO) << "ON SWITCH " << dev->switch_()->dpid() << " TRUSTED PORT " << dev->number() << " UP";
+        }
+        else {
+            itPort = itSW->second.ports.users.find(dev->number());
+            if (itPort != itSW->second.ports.users.end()) {
+                if (itSW->second.Status == false) {
+                    itSW->second.Status = true;
+                    //LOG(INFO) << "SWITCH " << dev->switch_()->dpid() << " UP";
+                    if (CFModPtr->switches_[dev->switch_()->dpid()].isEdge == true) {
+                        CSModPtr->numberSW++;
+                        //LOG(INFO) << "NUMBER OF EDGE SWITCHES IS " << CSModPtr->numberSW;
+                        CSModPtr->recount();
+                    }
+                }
+                itPort->second = true;
+                //LOG(INFO) << "ON SWITCH " << dev->switch_()->dpid() << " USERS PORT " << dev->number() << " UP";   
+
+            }
+            else {
+                itPort = itSW->second.ports.unknown.find(dev->number());
+                if (itPort != itSW->second.ports.unknown.end()) {
+                    itPort->second = true;
+                }
+                else {
+                    itSW->second.ports.unknown.emplace(dev->number(),true);
+                }
+                if (itSW->second.Status == false) {
+                    itSW->second.Status = true;
+                    //LOG(INFO) << "SWITCH " << dev->switch_()->dpid() << " UP";
+                    if (CFModPtr->switches_[dev->switch_()->dpid()].isEdge == true) {
+                        CSModPtr->numberSW++;
+                        //LOG(INFO) << "NUMBER OF EDGE SWITCHES IS " << CSModPtr->numberSW;
+                        CSModPtr->recount();
+                    }
+                }
+                //LOG(INFO) << "ON SWITCH " << dev->switch_()->dpid() << " UNKNOWN PORT " << dev->number() << " UP";
+            }
+        }
+    }
+    else {
+        controlFilterModule::SWobj sw(true,false);
+        sw.ports.unknown.emplace(dev->number(),true);
+        CFModPtr->switches_.emplace(dev->switch_()->dpid(), sw);
+        //LOG(INFO) << "SWITCH " << dev->switch_()->dpid() << " UP";
+        //LOG(INFO) << "ON SWITCH " << dev->switch_()->dpid() << " UNKNOWN PORT " << dev->number() << " UP";
+    }
+}
+
+void DDoS_Defender::onLinkDown(PortPtr dev) {
+    auto itSW = CFModPtr->switches_.find(dev->switch_()->dpid());
+    if (itSW != CFModPtr->switches_.end()) {
+        auto itPort = itSW->second.ports.trusted.find(dev->number());
+        if (itPort != itSW->second.ports.trusted.end()) {
+            itPort->second = false;
+            //LOG(INFO) << "ON SWITCH " << dev->switch_()->dpid() << " TRUSTED PORT " << dev->number() << " DOWN";
+        }
+        else {
+            auto itPort = itSW->second.ports.users.find(dev->number());
+            if (itPort != itSW->second.ports.users.end()) {
+                itPort->second = false;
+                std::string mac="",ip="";
+                for (auto it : BindingTable_) {
+                    if ((it.second.DPID == dev->switch_()->dpid()) && (it.second.PortNo == dev->number())) {
+                        mac += it.second.getStrMAC(); 
+                        ip += it.second.getStrIP();
+                        break;
+                    }
+                }
+                CFModPtr->delete_old_flows(sender_, mac, ip, dev->switch_()->dpid(), dev->number());
+                //LOG(INFO) << "ON SWITCH " << dev->switch_()->dpid() << " USERS PORT " << dev->number() << " DOWN";
+            }
+            else {
+                itPort = itSW->second.ports.unknown.find(dev->number());
+                if (itPort != itSW->second.ports.unknown.end()) {
+                    itPort->second = false;
+                    //LOG(INFO) << "ON SWITCH " << dev->switch_()->dpid() << " UNKNOWN PORT " << dev->number() << " DOWN";
+                }
+                else {
+                    LOG(INFO) << "the message came from a switch " << dev->switch_()->dpid() 
+                                << " from port that is not in switch's ports";
+                }
+                
+            }
+        }
+
+        if (itSW->second.isAllPortsOff() && itSW->second.Status) {
+            itSW->second.Status = false;
+            //LOG(INFO) << "SWITCH " << dev->switch_()->dpid() << " DOWN";
+            if (itSW->second.isEdge) {
+                CSModPtr->numberSW--;
+                CSModPtr->recount();
+            }
+            if (BindingTable_.size() != 0) {
+                for (auto it = BindingTable_.begin(); it != BindingTable_.end(); it++) {
+                    if (it->second.DPID == dev->switch_()->dpid()) {
+                        it->second.Status = false;
+                    }
+                }
+            }
+        }
+    }
+    else {
+        LOG(INFO) << "the message came from a switch " << dev->switch_()->dpid() << " that is not in switches_";
+    }
+
+    std::string ss = boost::lexical_cast<std::string>(dev->switch_()->dpid()) + boost::lexical_cast<std::string>(dev->number());
+    if (CFModPtr->sw_port_to_MAC.find(ss) != CFModPtr->sw_port_to_MAC.end())
+        BindingTable_.find(CFModPtr->sw_port_to_MAC[ss])->second.Status = false;
+}
+
+void DDoS_Defender::onLinkDiscovered(switch_and_port from, switch_and_port to) {
+    auto itSW = CFModPtr->switches_.find(from.dpid);
+    if (itSW != CFModPtr->switches_.end()) {
+        if (itSW->second.Status == false) {
+            itSW->second.Status = true;
+            //LOG(INFO) << "SWITCH " << from.dpid << " UP";
+            if (CFModPtr->switches_[from.dpid].isEdge == true) {
+                CSModPtr->numberSW++;
+                //LOG(INFO) << "NUMBER OF EDGE SWITCHES IS " << CSModPtr->numberSW;
+                CSModPtr->recount();
+            }
+        }
+        auto itPort = itSW->second.ports.unknown.find(from.port);
+        if (itPort != itSW->second.ports.unknown.end()) {
+            CFModPtr->switches_[from.dpid].ports.trusted.emplace(from.port,true);
+            CFModPtr->switches_[from.dpid].ports.unknown.erase(from.port);
+            //LOG(INFO) << "ON SWITCH " << from.dpid << " UNKNOWN PORT " << from.port << " COME TRUSTED";
+        }
+        else {
+            itPort = itSW->second.ports.users.find(from.port);
+            if (itPort != itSW->second.ports.users.end()) {
+                CFModPtr->switches_[from.dpid].ports.trusted.emplace(from.port,true);
+                CFModPtr->switches_[from.dpid].ports.users.erase(from.port);
+                //LOG(INFO) << "ON SWITCH " << from.dpid << " UNKNOWN PORT " << from.port << " COME TRUSTED";
+            }
+            else {
+                itPort = itSW->second.ports.trusted.find(from.port);
+                if (itPort != itSW->second.ports.trusted.end()) {
+                    itPort->second = true;
+                }
+                else
+                    CFModPtr->switches_[from.dpid].ports.trusted.emplace(from.port,true);
+                //LOG(INFO) << "ON SWITCH " << from.dpid << " TRUSTED PORT " << from.port << " UP";
+            }
+        }
+    }
+    else {
+        controlFilterModule::SWobj sw(true,false);
+        sw.ports.trusted.emplace(from.port,true);
+        CFModPtr->switches_.emplace(from.dpid, sw);
+        //LOG(INFO) << "SWITCH " << from.dpid << " UP";
+        //LOG(INFO) << "ON SWITCH " << from.dpid << " TRUSTED PORT " << from.port << " UP";
+    } 
+
+    itSW = CFModPtr->switches_.find(to.dpid);
+    if (itSW != CFModPtr->switches_.end()) {
+        if (itSW->second.Status == false) {
+            itSW->second.Status = true;
+            //LOG(INFO) << "SWITCH " << to.dpid << " UP";
+            if (CFModPtr->switches_[to.dpid].isEdge == true) {
+                CSModPtr->numberSW++;
+                //LOG(INFO) << "NUMBER OF EDGE SWITCHES IS " << CSModPtr->numberSW;
+                CSModPtr->recount();
+            }
+        }
+        auto itPort = itSW->second.ports.unknown.find(to.port);
+        if (itPort != itSW->second.ports.unknown.end()) {
+            CFModPtr->switches_[to.dpid].ports.trusted.emplace(to.port,true);
+            CFModPtr->switches_[to.dpid].ports.unknown.erase(to.port);
+            //LOG(INFO) << "ON SWITCH " << to.dpid << " UNKNOWN PORT " << to.port << " COME TRUSTED";
+        }
+        else {
+            itPort = itSW->second.ports.users.find(to.port);
+            if (itPort != itSW->second.ports.users.end()) {
+                CFModPtr->switches_[to.dpid].ports.trusted.emplace(to.port,true);
+                CFModPtr->switches_[to.dpid].ports.users.erase(to.port);
+                //LOG(INFO) << "ON SWITCH " << to.dpid << " UNKNOWN PORT " << to.port << " COME TRUSTED";
+            }
+            else {
+                itPort = itSW->second.ports.trusted.find(to.port);
+                if (itPort != itSW->second.ports.trusted.end()) {
+                    itPort->second = true;
+                }
+                else
+                    CFModPtr->switches_[to.dpid].ports.trusted.emplace(to.port,true);
+                //LOG(INFO) << "ON SWITCH " << to.dpid << " TRUSTED PORT " << to.port << " UP";
+            }
+        }
+    }
+    else {
+        controlFilterModule::SWobj sw(true,false);
+        sw.ports.trusted.emplace(to.port,true);
+        CFModPtr->switches_.emplace(to.dpid, sw);
+        //LOG(INFO) << "SWITCH " << to.dpid << " UP";
+        //LOG(INFO) << "ON SWITCH " << to.dpid << " TRUSTED PORT " << to.port << " UP";
+    }
+}
+
+struct PortStatCount {
+    uint64_t dpid;
+    uint32_t port;
+    int drop;
+    int packets;
+    int flows;
+    bool from_LS;
+
+    PortStatCount(uint64_t dpd=0, uint32_t prt=0, int dr=0, int pckt=0, int fls=0, bool fLS=false) : 
+                        dpid(dpd), port(prt), drop(dr), packets(pckt), flows(fls), from_LS(fLS) {}
+};
+
 
 void DDoS_Defender::init(Loader *loader, const Config &rootConfig){
 
-    auto config = config_cd(rootConfig, "ddos-defender");
-    crit_good_flows = config_get(config, "crit_good_flows", 3);
-    alpha = string_to_float(config_get(config, "alpha", "0.2").c_str());
-    threshold_low = string_to_float(config_get(config, "threshold_low", "0.3").c_str());
-    threshold_hight = string_to_float(config_get(config, "threshold_hight", "0.7").c_str());
-    threshold_cpu_util = string_to_float(config_get(config, "threshold_cpu_util", "80.0").c_str());
-    THRESHOLD = config_get(config, "THRESHOLD",100);
-    interval = config_get(config, "interval", 3);
-    hosts_amount = config_get(config, "hosts_amount", 8);
+    LOG(INFO) << "";
+    LOG(INFO) << "=====================";
+    LOG(INFO) << "DDoS_Defender init start";        
+    LOG(INFO) << "---------------------";
 
-    //test_interval = false; //FOR TESTING
+    auto config = config_cd(rootConfig, "ddos-defender");
+    alpha = string_to_float(config_get(config, "alpha", "0.2").c_str());
+    threshold_cpu_util = string_to_float(config_get(config, "TCU", "80.0").c_str());
+    tau = config_get(config, "tau", 3);
+    common_t = tau*3;
+    big_t = common_t*3;
+    omega = 100;
+    sw_response_number = 0;
+    commonPNF = 5.0;
+    threshold_low = 1.0 / tau;
+    threshold_hight = float(commonPNF) / tau;
+    numberClearTables = 0;
+    CLEAR = true;
+
+    LOG(INFO) << "alpha = " << alpha;
+    LOG(INFO) << "TCU = " << threshold_cpu_util;
+    LOG(INFO) << "tau = " << tau;
+    LOG(INFO) << "omega = " << omega;
+    LOG(INFO) << "threshold_low = " << threshold_low;
+    LOG(INFO) << "threshold_hight = " << threshold_hight;
+
+    
 
     init_cpu_util();
-
-    BuildDone = false;
-    HostsDone = false;
     ATTACK = false;
-    HostManager *hm = HostManager::get(loader);
+    HostManager* host_manager_ = HostManager::get(loader);
+    DhcpServer* dhcp_server_ = DhcpServer::get(loader);
+    LinkDiscovery* link_discovery_ = dynamic_cast<LinkDiscovery*>(LinkDiscovery::get(loader));
     switch_manager_ = SwitchManager::get(loader);
     sender_ = OFMsgSender::get(loader);
 
     //ADD HOSTS
-    QObject::connect(hm, &HostManager::hostDiscovered, [this](Host* dev){
-        host_info host(dev->mac(), dev->ip(), dev->switchPort(), dev->switchID());
-        hosts.push_back(host);
-    });
+    QObject::connect(host_manager_, &HostManager::hostDiscovered, this, &DDoS_Defender::onHostDiscovered);
 
-    //FLOW STATS REPLY
+    //CHANGED IP
+    QObject::connect(dhcp_server_, &DhcpServer::addrChanged, this, &DDoS_Defender::onAddrChanged);
+
+    //CHANGE SWITCH STATUS
+    QObject::connect(switch_manager_, &SwitchManager::switchUp, this, &DDoS_Defender::onSwitchUp);
+
+    QObject::connect(switch_manager_, &SwitchManager::switchDown, this, &DDoS_Defender::onSwitchDown);
+    
+    //CHANGE PORT STATUS
+    QObject::connect(switch_manager_, &SwitchManager::linkUp, this, &DDoS_Defender::onLinkUp);
+
+    QObject::connect(switch_manager_, &SwitchManager::linkDown, this, &DDoS_Defender::onLinkDown);
+
+    QObject::connect(link_discovery_, &LinkDiscovery::linkDiscovered, this, &DDoS_Defender::onLinkDiscovered);
+  
     handler_ = Controller::get(loader)->register_handler(
     [this](of13::PacketIn& pi, OFConnectionPtr ofconn) -> bool
     {
@@ -138,38 +708,279 @@ void DDoS_Defender::init(Loader *loader, const Config &rootConfig){
 
         std::string str_mac = boost::lexical_cast<std::string>(src_mac);
         std::string str_ip = correct_ip_addr(boost::lexical_cast<std::string>(src_ip));
+        auto itBT = BindingTable_.find(str_mac);
+        if (itBT != BindingTable_.end()) {
+            if (CSModPtr->stats_[itBT->second.DPID].ports.find(itBT->second.PortNo)
+                != CSModPtr->stats_[itBT->second.DPID].ports.end()) {
+                CSModPtr->stats_[itBT->second.DPID].ports[itBT->second.PortNo].gamma++;
+                CSModPtr->stats_[itBT->second.DPID].ports[itBT->second.PortNo].gamma_per_tau++;
+                CSModPtr->stats_[itBT->second.DPID].beta++;
+                CSModPtr->stats_[itBT->second.DPID].lambda++;
+                CSModPtr->sumBeta++;
+                CSModPtr->sumLambda++;
+            }
+            if ((str_ip != "0.0.0.0") && (itBT->second.IP == convert("0.0.0.0").first)) { 
+                CFModPtr->add_filtered_flows(sender_, str_mac, str_ip, itBT->second.DPID, itBT->second.PortNo);
+                if (itBT->second.Status) {
+                    //LOG(INFO) << "HOST " << str_mac << " : " << itBT->second.oldIP << " STATIC CHANGED IP to " << str_ip;
+                }
+                else {
+                    itBT->second.Status = true;
+                }
+                itBT->second.IP = convert(str_ip).first;
+                if (str_mac != "00:00:00:00:00:00") {
+                    itBT->second.isHost = true;
+                    //LOG(INFO) << "NODE " << str_mac << " : " << str_ip << " IS HOST and ON";
 
-        if (!BuildDone) { // BUILDING IP_BIND_TABLE
-            add_to_RevTable(str_mac, str_ip, in_port, dpid);
-            check_RevTable();
-        }
-        else { // INCREASING SRC PACKET_IN COUNTER
-            std::string key = "MAC " + str_mac + " IP " + str_ip;
-            if (src_criterion.find(key) != src_criterion.end()){
-                src_criterion[key].curr_counter += 1;
-                attack_end[key].curr_counter += 1;
-                if ((src_criterion[key].curr_counter > THRESHOLD)
-                        and (ATTACK == false)) {
-                    LOG(INFO) << "TOO MANY PACKET_IN FROM " << key;
-                    LOG(INFO) << "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!";
-                    ATTACK = true;
+                }
+
+                if (CFModPtr->switches_[itBT->second.DPID].Status == false) {
+                    LOG(INFO) << "the message came from a switch " << itBT->second.DPID << " that is OFF";
+                }
+                auto it = CFModPtr->switches_.find(itBT->second.DPID);
+                if (it != CFModPtr->switches_.end()) {
+                    if (CFModPtr->switches_[itBT->second.DPID].Status == false) {
+                        LOG(INFO) << "the message came from a switch " << itBT->second.DPID << " that is OFF";
+                    }
+                    auto itPort = it->second.ports.unknown.find(itBT->second.PortNo);
+                    if (itPort != it->second.ports.unknown.end()) {
+                        CFModPtr->switches_[itBT->second.DPID].ports.users.emplace(itBT->second.PortNo,true);
+                        CFModPtr->switches_[itBT->second.DPID].ports.unknown.erase(itBT->second.PortNo);
+                        std::string sw_port = boost::lexical_cast<std::string>(itBT->second.DPID) + 
+                                                boost::lexical_cast<std::string>(itBT->second.PortNo);
+                        CFModPtr->sw_port_to_MAC.emplace(sw_port,str_mac);
+                        collectStatsModule::statsPort port;
+                        CSModPtr->stats_[itBT->second.DPID].ports.emplace(itBT->second.PortNo, port);
+                        //LOG(INFO) << "ON SWITCH " << itBT->second.DPID << " UNKNOWN PORT " << itBT->second.PortNo << " COME USERS";
+                    }
+                    else {
+                        itPort = it->second.ports.trusted.find(itBT->second.PortNo);
+                        if (itPort != it->second.ports.trusted.end()) {
+                            if (itPort->second == false) {
+                                //LOG(INFO) << "the message came from a switch " << itBT->second.DPID << " from port " 
+                                //                << itBT->second.PortNo << " that is OFF";
+                            }
+                            CFModPtr->switches_[itBT->second.DPID].ports.users.emplace(itBT->second.PortNo, true);
+                            CFModPtr->switches_[itBT->second.DPID].ports.trusted.erase(itBT->second.PortNo);
+                            std::string sw_port = boost::lexical_cast<std::string>(itBT->second.DPID) + 
+                                                    boost::lexical_cast<std::string>(itBT->second.PortNo);
+                            CFModPtr->sw_port_to_MAC.emplace(sw_port,str_mac);
+                            collectStatsModule::statsPort port;
+                            CSModPtr->stats_[itBT->second.DPID].ports.emplace(itBT->second.PortNo, port);
+                            //LOG(INFO) << "ON SWITCH " << itBT->second.DPID << " TRUSTED PORT " << itBT->second.PortNo << " COME USERS";
+                        }
+                    }
+                    if (CFModPtr->switches_[itBT->second.DPID].isEdge == false) {
+                        CFModPtr->switches_[itBT->second.DPID].isEdge = true;
+                        //LOG(INFO) << "SWITCH " << itBT->second.DPID << " is EDGE";
+                        CSModPtr->numberSW++;
+
+                        collectStatsModule::statsSW ssw;
+                        CSModPtr->stats_.emplace(itBT->second.DPID, ssw);
+                        //LOG(INFO) << "NUMBER OF EDGE SWITCHES IS " << CSModPtr->numberSW;
+                        CSModPtr->recount();
+                    }
+                }
+                else {
+                    LOG(INFO) << "the message came from a switch " << itBT->second.DPID << " that is not in switches_";
+                }
+                
+            }
+            else {
+                if ((str_ip != "0.0.0.0") && (itBT->second.IP != convert(str_ip).first)) {
+                    LOG(INFO) << "the message came from the host " << str_ip 
+                                << " with different IP that is in the BindingTable " << itBT->second.IP;
+                    if (itBT->second.oldIP == convert("0.0.0.0").first) {
+                        CFModPtr->delete_old_flows(sender_, str_mac, itBT->second.getStrIP(), itBT->second.DPID, itBT->second.PortNo);
+                        CFModPtr->add_filtered_flows(sender_, str_mac, str_ip, itBT->second.DPID, itBT->second.PortNo);
+                        if (itBT->second.Status) {
+                        //    LOG(INFO) << "HOST " << str_mac << " : " << itBT->second.IP << " STATIC CHANGED IP to " << str_ip;
+                        }
+                        else {
+                            itBT->second.Status = true;
+                        }
+                        itBT->second.IP = convert(str_ip).first;
+                        if (str_mac != "00:00:00:00:00:00") {
+                            itBT->second.isHost = true;
+                            //LOG(INFO) << "NODE " << str_mac << " : " << str_ip << " IS HOST and ON";
+
+                        }
+
+                    }           
+                }
+                else if ((str_ip != "0.0.0.0") && (itBT->second.IP == convert(str_ip).first) && (itBT->second.Status == false)) {
+                    if (dpid != itBT->second.DPID) {
+                        //LOG(INFO) << "HOST " << str_mac << " : " << str_ip << " MIGRATED from " << itBT->second.DPID 
+                        //            << ":" << itBT->second.PortNo << " to " << dpid << ":" << in_port;
+                        itBT->second.DPID = dpid;
+                        itBT->second.PortNo = in_port;
+                        itBT->second.Status = true;
+                    }
+                    else if (in_port != itBT->second.PortNo) {
+                        //LOG(INFO) << "HOST " << str_mac << " : " << str_ip << " MIGRATED from " << itBT->second.PortNo 
+                        //            << " to " << in_port;
+                        itBT->second.PortNo = in_port;
+                        itBT->second.Status = true;
+                    }
                 }
             }
+            if (itBT->second.Status == false) {
+                //LOG(INFO) << "HOST " << str_mac << " : " << str_ip << " is ON from " << itBT->second.PortNo 
+                //            << " to " << in_port;
+                itBT->second.Status = true;
+            }
         }
-
         return false;
     }, -30);
 
+    handler_flow_removed_ = Controller::get(loader)->register_handler(
+    [this](of13::FlowRemoved& pi, OFConnectionPtr ofconn) -> bool
+    {
+
+        of13::Match match = pi.match();
+        uint32_t in_port = 0;
+        if (match.in_port()) in_port = match.in_port()->value();
+        LOG(INFO) << "FLOW_REMOVED from SW=" << ofconn->dpid() << " : port=" << in_port 
+                    << " : cookie=" << pi.cookie();
+        std::string sw_port = boost::lexical_cast<std::string>(ofconn->dpid()) + 
+                                boost::lexical_cast<std::string>(in_port);
+        auto itMAC = CFModPtr->sw_port_to_MAC.find(sw_port);
+        if ((itMAC != CFModPtr->sw_port_to_MAC.end()) && (pi.cookie() == 4)) {
+            auto itBT = BindingTable_.find(itMAC->second);
+            auto itST = CSModPtr->stats_.find(ofconn->dpid());
+            if ((itST != CSModPtr->stats_.end()) && (itBT != BindingTable_.end())) {
+                auto itPort = itST->second.ports.find(in_port);
+                if ((itPort != itST->second.ports.end()) && (itPort->second.type == INF)) {
+                    itPort->second.type = USR;
+                    itPort->second.score = threshold_hight;
+                    auto it = infectedMACs_.find(itMAC->first);
+                    if (it != infectedMACs_.end()) infectedMACs_.erase(it);
+                    LOG(INFO) << "INFECTED HOST " << itBT->second.getStrIP() << " COME USERS : score=" 
+                        << itPort->second.score
+                        << " : type=" << itPort->second.whatType();
+                }
+            }
+        }
+        return false;
+    }, -30);
+
+    //FLOW STATS REPLY
     handler_flow_stats_ = Controller::get(loader)->register_handler(
     [this](of13::MultipartReplyFlow pi, OFConnectionPtr ofconn) -> bool
     {
-    
+        sw_response_number++;
         uint64_t sw_id = ofconn->dpid();
-        std::vector<of13::FlowStats> flow_stats = pi.flow_stats();
+        if (BindingTable_.size()) {
+            std::unordered_map<std::string, PortStatCount> portStats;
+            for (auto flow : pi.flow_stats()){
+                of13::FlowStats *flow1 = static_cast<of13::FlowStats *>(&flow);
+                of13::Match match = flow1->match();
+                uint32_t in_port = 0;
+                std::string eth_src = "";
+                if (match.in_port()) in_port = match.in_port()->value();
+                if (match.eth_src()) eth_src += match.eth_src()->value().to_string();
+                //LOG(INFO) << "SW(" << sw_id << ") :: in_port=" << in_port 
+                //                    << " : eth_src=" << eth_src
+                //                    << " : flow_prior=" << flow1->priority()
+                //                    << " : cookie=" << flow1->cookie();
+                
+                auto itBT = BindingTable_.find(eth_src);
+                if (itBT != BindingTable_.end()) {
+                    auto it = portStats.find(eth_src);
+                    if (it != portStats.end()){
+                        if (flow1->cookie() == 0x2) {
+                            it->second.drop+=flow.packet_count();
+                        }
+                        else if (flow1->cookie() != 0x3) {
+                            it->second.packets+=flow.packet_count();
+                            it->second.flows++;
+                            it->second.from_LS = (flow1->cookie() == 0x0) ? true : false;
+                        }
+                    }
+                    else {
+                        if (flow1->cookie() == 0x2) {
+                            portStats.emplace(eth_src,PortStatCount(sw_id,in_port,flow.packet_count()));
+                        }
+                        else if (flow.cookie() != 0x3) {
+                            bool from_LS = (flow1->cookie() == 0x0) ? true : false;
+                            portStats.emplace(eth_src,PortStatCount(sw_id,in_port,0,flow.packet_count(),1,from_LS));
+                        }
+                    }
+                }
+                else if (flow1->cookie() == 0x4) {
+                    std::string sw_port = boost::lexical_cast<std::string>(sw_id) + 
+                                            boost::lexical_cast<std::string>(in_port);
+                    auto itMAC = CFModPtr->sw_port_to_MAC.find(sw_port);
+                    if (itMAC != (CFModPtr->sw_port_to_MAC).end()) {
+                        auto it = portStats.find(itMAC->second);
+                        if (it != portStats.end()) {
+                            it->second.drop+=flow.packet_count();
+                        }
+                        else {
+                            portStats.emplace(itMAC->second,PortStatCount(sw_id,in_port,flow.packet_count()));
+                        }
+                    }
+                }
+            }
+            if (!portStats.size()) {
+                auto itSW = CSModPtr->stats_.find(sw_id);
+                for (auto itPort=itSW->second.ports.begin(); itPort != itSW->second.ports.end(); itPort++){
+                    if (itPort->second.diff_drop || itPort->second.drop) {
+                        itPort->second.diff_drop = 0;
+                        itPort->second.drop = 0;
+                    }
+                    itPort->second.PNF = commonPNF;
+                }
+            }
+            
+            int diff = 0;
+            bool clear_table = true;
+            for (auto it : portStats) {
+                if ((infectedMACs_.find(it.first)!=infectedMACs_.end()) && it.second.from_LS) clear_table = false;
+                auto elemBT = BindingTable_.find(it.first);
+                if ((elemBT != BindingTable_.end()) && (sw_id == elemBT->second.DPID))  {
+                    auto elemST = CSModPtr->stats_[sw_id].ports.find(elemBT->second.PortNo);
 
+                    //LOG(INFO) << "port(portStats)=" << elemBT->second.PortNo << " :: drop=" << it.second.drop
+                    //            << " : packets=" << it.second.packets << " : flows=" << it.second.flows;
+                    if (elemST != CSModPtr->stats_[sw_id].ports.end()) {
+                        //LOG(INFO) << "port(stats_)=" << elemST->first << " :: drop=" << elemST->second.drop
+                        //            << " : diff_drop=" << elemST->second.diff_drop;
+
+                        if (it.second.drop > elemST->second.drop) 
+                            diff = it.second.drop - elemST->second.drop;
+                        else diff = 0;
+
+                        if ((diff < 2*common_t) && (diff) && (elemST->second.type != INF)) {
+                            CFModPtr->delete_old_flows(sender_, it.first, elemBT->second.getStrIP(), 
+                                                                        sw_id,  elemBT->second.PortNo);
+                            elemBT->second.oldIP = elemBT->second.IP;
+                            elemBT->second.IP = convert("0.0.0.0").first;
+                            LOG(INFO) << "response from SW=" << sw_id << ": HAVE SOME DROPPED PACKETS per interval(" << diff
+                                        << ") FROM " << it.first << " : " << elemBT->second.oldIP;
+                        }
+                        else if (diff && (elemST->second.type != INF)) {
+                            LOG(INFO) << "response from SW=" << sw_id << ": TOO MANY DROPPED PACKETS per interval(" << diff 
+                                        << ") FROM " << it.first << " : " << elemBT->second.getStrIP();
+                        }
+                    
+                        elemST->second.diff_drop = diff;
+                        elemST->second.drop = it.second.drop;
+                        elemST->second.PNF = (it.second.flows) ? float(it.second.packets) / it.second.flows : commonPNF;
+                    }
+                
+                }
+            }  
+            if (clear_table && !CLEAR) numberClearTables++;  
+            if ((numberClearTables == CSModPtr->stats_.size()) && !CLEAR) {
+                CLEAR = true;
+                LOG(INFO) << "!!!!!!!!!!!!!!!!!!END CLEAR TABLES!!!!!!!!!!!!!!!!!!!";
+            }
+        }
         //FOR TESTING
-        /*
-        if (!test_interval) {
+        
+        /*if (!test_interval) {
+            LOG(INFO) << "STATS FROM SWITCH ID " << sw_id;
             add_flow_statistic_from_switch(flow_stats, sw_id);
             bool done = true;
             for (auto it : switch_flow_test){
@@ -183,12 +994,11 @@ void DDoS_Defender::init(Loader *loader, const Config &rootConfig){
             }
         }
         else {
-            print_flow_test();
             test_interval = false;
-        }
-        */
-        add_src_statistic_from_switch(flow_stats, sw_id);
-
+        }*/
+        
+        //add_src_statistic_from_switch(flow_stats, sw_id);
+        /*
         bool is_filled = true;
         sw_response[sw_id] = true;
         for (auto it : sw_response)
@@ -201,305 +1011,385 @@ void DDoS_Defender::init(Loader *loader, const Config &rootConfig){
             if (is_filled == true) {
                 check_attack_end();
             }
-            print_attack_end();
-        }
+        }*/
         return false;
     }, -30);
+
+    LOG(INFO) << "----------------------------------";
+    LOG(INFO) << "DDoS_Defender init finish its work";
+    LOG(INFO) << "==================================";
 }
 
 void DDoS_Defender::startUp(Loader* ) {
-    startTimer(interval*2000);
+    startTimer(tau*1000);
+    current_time = 0;
+
 }
 
 
 void DDoS_Defender::timerEvent(QTimerEvent*) {
-    if (BuildDone){
-        get_cpu_util();
-        get_flow_stats();
+    current_time+=tau;
+    get_cpu_util();
+    bool isCommonInterval = (current_time % (common_t)) ? false : true;
+    if(isCommonInterval && !ATTACK) {
+        LOG(INFO) << "**********************************************";
+        LOG(INFO) << "CURRENT TIME " << current_time;
+        CFModPtr->printSwitches();
+        LOG(INFO) << "----------------------------------------";
+        CFModPtr->getFlowStats(sender_);
+        CSModPtr->comparison();
+        trackINFHosts();
+        printBindingTable();
+        LOG(INFO) << "**********************************************";
     }
-    else if (HostsDone) {
-        build_IPBindTable();
-        print_ip_table();
-        build_ports_set();
-        print_ports();
-        init_src_criterion();
-        send_init_flowmods();
-        BuildDone = true;
+    if (ATTACK) {
+        CFModPtr->getFlowStats(sender_);
+        checkScore();
     }
-    else {
-        //print_hosts();
-        //print_rev_ip_table();
+
+    if (sw_response_number >= CSModPtr->numberSW) {
+        LOG(INFO) << "----------------------------------------";
+        CSModPtr->printStats();
+        LOG(INFO) << "----------------------------------------";
+        sw_response_number = 0;
     }
+
+    CSModPtr->clean();
 }
 
-void DDoS_Defender::add_to_RevTable(std::string mac, std::string ip, uint32_t port_no, uint64_t sw_id){
-    std::string key = "MAC " + mac + " IP " + ip;
-    auto find_key = RevIPBindTable.find(key);
-    if (find_key == RevIPBindTable.end()){
-        host_info host(mac, ip, port_no, sw_id);
-        RevIPBindTable.insert({key,host});
-        int index = 0;
-        for (auto it_hosts : hosts){
-            if ((it_hosts.mac == mac) and (it_hosts.ip == "0.0.0.0")) {
-                hosts[index] = host;
-                break;
-            }
-            index++;
-        }
-    }
-    else {
-        host_info host(mac, ip, find_key->second.switch_port, find_key->second.switch_id);
-        RevIPBindTable[key] = host;
-        int index = 0;
-        for (auto it_hosts : hosts){
-            if ((it_hosts.mac == mac) and (it_hosts.ip == "0.0.0.0")) {
-                hosts[index] = host;
-                break;
-            }
-            index++;
-        }
-    }
-
-    //print_rev_ip_table();
-}
-
-void DDoS_Defender::check_RevTable(){
-    //print_hosts();
-    bool find_all_hosts = true;
-    unsigned int not_zero_ip = 0;
-    if (hosts.size() == 0) {
-        find_all_hosts = false;
-    }
-    for (auto it_hosts : hosts) {
-        bool find_host = false;
-        for (auto it_revtable : RevIPBindTable) {
-            if (it_hosts.mac == it_revtable.second.mac) {
-                find_host = true;
-                if (it_revtable.second.ip != "0.0.0.0"){
-                    not_zero_ip++;
-                    break;
+void DDoS_Defender::checkScore(){
+    float score = 0;
+    bool is_attack_end = true;
+    for (auto itSW = CSModPtr->stats_.begin(); itSW != CSModPtr->stats_.end(); itSW++) {
+        for (auto itPort = itSW->second.ports.begin(); itPort != itSW->second.ports.end(); itPort++) {
+            LOG(INFO) << "PORT(" << itPort->first << ") :: gamma_per_tau="
+                        << itPort->second.gamma_per_tau << " : PNF="
+                        << itPort->second.PNF << " : last_score=" 
+                        << itPort->second.score;
+            score = (itPort->second.gamma_per_tau) ? 
+                        itPort->second.PNF / itPort->second.gamma_per_tau :
+                        itPort->second.PNF;
+            itPort->second.score = score;
+            if (itPort->second.type != INF) {
+                if (score <= threshold_low) {
+                    score = score*(1-alpha) + itPort->second.score*alpha;
+                    itPort->second.type = INF;
+                    send_drop_flows(itSW->first,itPort->first);
+                    std::string sw_port = boost::lexical_cast<std::string>(itSW->first) + 
+                                            boost::lexical_cast<std::string>(itPort->first);
+                    auto itMAC = CFModPtr->sw_port_to_MAC.find(sw_port);
+                    if (itMAC != CFModPtr->sw_port_to_MAC.end()) {
+                        infectedMACs_.insert(itMAC->second);
+                    }
+                }
+                else {
+                    if (score >= threshold_hight) {
+                        score = score*(1-alpha) + itPort->second.score*alpha;
+                        itPort->second.type = USR;
+                    }
+                    else { 
+                        if (cpu_util > threshold_cpu_util) {
+                            score = score*(1-alpha) + itPort->second.score*alpha;
+                            itPort->second.type = INF;
+                            send_drop_flows(itSW->first,itPort->first);
+                            std::string sw_port = boost::lexical_cast<std::string>(itSW->first) + 
+                                                    boost::lexical_cast<std::string>(itPort->first);
+                            auto itMAC = CFModPtr->sw_port_to_MAC.find(sw_port);
+                            if (itMAC != CFModPtr->sw_port_to_MAC.end()) {
+                                infectedMACs_.insert(itMAC->second);
+                            }
+                        }
+                        else {
+                            score = score*(1-alpha) + itPort->second.score*alpha;
+                            itPort->second.type = AMB;
+                            is_attack_end = false;
+                        }
+                    }
                 }
             }
         }
-        if (!find_host) {
-            find_all_hosts = false;
-            break;
-        }
     }
-    if (find_all_hosts and (not_zero_ip==hosts_amount)) {
-        HostsDone = true;
+    if (is_attack_end && (CSModPtr->sumBeta <= omega)) {
+        ATTACK = !is_attack_end;
+        LOG(INFO) << "!!!!!!!!!!!!!!!!!!!!!ATTACK END!!!!!!!!!!!!!!!!!!!!!!!!!!";
+        numberClearTables = 0;
+        CLEAR = false;
+        clearTables();
     }
 }
 
-void DDoS_Defender::build_IPBindTable(){
-    for (auto it_hosts : hosts) {
-        for (auto it_rev_table : RevIPBindTable){
-            if (((it_hosts.ip == it_rev_table.second.ip) or (correct_ip_addr(it_hosts.ip) == it_rev_table.second.ip))
-                and (it_hosts.mac == it_rev_table.second.mac) and (it_hosts.ip != "0.0.0.0")){
-                host_info host(it_rev_table.second.mac, it_rev_table.second.ip,
-                               it_rev_table.second.switch_port, it_rev_table.second.switch_id);
-                std::string key = "MAC " + it_rev_table.second.mac + " IP " + it_rev_table.second.ip;
-                IPBindTable.insert({key, host});
+void DDoS_Defender::clearTables() {
+    for (auto infMAC : infectedMACs_) {
+        for (auto itSW : CSModPtr->stats_) {
+            LOG(INFO) << "send delete flows to SW=" << itSW.first << " for MAC=" << infMAC;
+            of13::FlowMod fm1, fm2;
+            std::stringstream ss;
+            fm1.command(of13::OFPFC_DELETE); fm2.command(of13::OFPFC_DELETE);
+            fm1.table_id(of13::OFPTT_ALL); fm2.table_id(of13::OFPTT_ALL);
+            fm1.priority(2); fm2.priority(2);
+            fm1.cookie(0x0); fm2.cookie(0x0);
+            fm1.cookie_mask(0); fm2.cookie_mask(0);
+            fm1.idle_timeout(uint64_t(60)); fm2.idle_timeout(uint64_t(60)); 
+            fm1.hard_timeout(uint64_t(1800)); fm2.hard_timeout(uint64_t(1800)); 
+
+            ethaddr eth_src(infMAC);
+            ss.str(std::string());
+            ss.clear();
+            ss << eth_src;
+            fm1.add_oxm_field(new of13::EthSrc{fluid_msg::EthAddress(ss.str())});
+            fm2.add_oxm_field(new of13::EthSrc{fluid_msg::EthAddress (ss.str())});
+
+            fm1.out_port(of13::OFPP_ANY); fm2.out_port(of13::OFPP_ANY);
+            fm1.out_group(of13::OFPP_ANY); fm2.out_group(of13::OFPP_ANY);
+
+            sender_->send(itSW.first, fm1);
+            sender_->send(itSW.first, fm2);
+        }
+    }
+}
+
+void DDoS_Defender::trackINFHosts(){
+    if (CSModPtr->stats_.size()) {
+        for (auto itSW=CSModPtr->stats_.begin(); itSW!=CSModPtr->stats_.end(); itSW++){
+            if (itSW->second.beta < itSW->second.alpha) {
+                for (auto itPort = itSW->second.ports.begin(); itPort!=itSW->second.ports.end(); itPort++) {
+                    if (itPort->second.type == INF) {
+                        std::string sw_port = boost::lexical_cast<std::string>(itSW->first) + 
+                                                boost::lexical_cast<std::string>(itPort->first);
+                        auto itMAC = CFModPtr->sw_port_to_MAC.find(sw_port);
+                        auto itBT = BindingTable_.find(itMAC->second);
+                        itPort->second.type = USR;
+                        itPort->second.score = threshold_hight;
+                        auto it = infectedMACs_.find(itMAC->first);
+                        if (it != infectedMACs_.end()) infectedMACs_.erase(it);
+                        LOG(INFO) << "INFECTED HOST " << itBT->second.getStrIP() << " COME USERS : score=" 
+                            << itPort->second.score
+                            << " : type=" << itPort->second.whatType();
+                    }
+                }
+            }
+        }
+    }
+}
+
+void collectStatsModule::comparison(){
+    if (stats_.size()) {
+        bool isRecountAlpha = false;
+        for (auto itSW=stats_.begin(); itSW!=stats_.end(); itSW++){
+            for (auto itPort : itSW->second.ports) {
+                if (itPort.second.whatType() == "INF") {
+                    itSW->second.beta += itPort.second.diff_drop;
+                    itSW->second.lambda += itPort.second.diff_drop;
+                    sumLambda += itPort.second.diff_drop;
+                }
+            }
+            if ((itSW->second.beta > itSW->second.alpha) && (sumBeta > omega)) {
+                ATTACK = true;
+                LOG(INFO) << "!!!!!!!!!!!!!!!!!!!!!ATTACK BEGIN!!!!!!!!!!!!!!!!!!!!!!!!!!";
                 break;
             }
+            else if ((itSW->second.beta > itSW->second.alpha) && (sumBeta <= omega)) {
+                isRecountAlpha = true;
+            }
         }
-    }
-    RevIPBindTable.clear();
-}
-
-void DDoS_Defender::build_ports_set(){
-    std::set<uint64_t> switches_set;
-    for (auto it_ip_table : IPBindTable){
-        auto find_switch = switches_set.find(it_ip_table.second.switch_id);
-        if (find_switch != switches_set.end()) {
-            switches[*find_switch].user.insert(it_ip_table.second.switch_port);
-        }
-        else {
-            ports elem;
-            elem.user.insert(it_ip_table.second.switch_port);
-            switches.insert({it_ip_table.second.switch_id, elem});
-            sw_response.insert({it_ip_table.second.switch_id, false});
-            //flow_stat elem2; //for testing
-            //switch_flow_test.insert({it_ip_table.second.switch_id, elem2}); //for testing
-            switches_set.insert(it_ip_table.second.switch_id);
-        }
-    }
-    for (auto it_switch_set : switches){
-        auto sw = switch_manager_->switch_(it_switch_set.first);
-        std::vector<PortPtr> ports = sw->ports();
-        for (auto it_ports : ports){
-            if (switches[it_switch_set.first].user.find(it_ports->number()) ==
-                    switches[it_switch_set.first].user.end()) {
-                switches[it_switch_set.first].trusted.insert(it_ports->number());
+        if (isRecountAlpha && sumLambda) {
+            isAlphaExceed = true;
+            for (auto itSW=stats_.begin(); itSW!=stats_.end(); itSW++){
+                itSW->second.alpha = trunc((omega*itSW->second.lambda)/sumLambda);
             }
         }
     }
-    switches_set.clear();
 }
 
-void DDoS_Defender::init_src_criterion(){
-    for (auto it : IPBindTable){
-        score elem_score;
-        elem_score.host = it.second;
-        src_criterion.insert({it.first,elem_score});
-        counters elem;
-        attack_end.insert({it.first,elem});
+void collectStatsModule::recount(){
+    if (isAlphaExceed && sumLambda) {
+        for (auto itSW=stats_.begin(); itSW!=stats_.end(); itSW++){
+            itSW->second.alpha = trunc((omega*itSW->second.lambda)/sumLambda);
+        }
+    }
+    else if (numberSW) {
+        for (auto itSW=stats_.begin(); itSW!=stats_.end(); itSW++){
+            itSW->second.alpha = trunc(omega/numberSW);
+        }
     }
 }
 
-void DDoS_Defender::add_src_statistic_from_switch(std::vector<of13::FlowStats> flow_stats, uint64_t sw_id){
-    //CLEAN OLD STATISTIC
-    for (auto it_src_crit : src_criterion){
-        if (src_criterion[it_src_crit.first].host.switch_id == sw_id) {
-            src_criterion[it_src_crit.first].all_flows = 1;
-            src_criterion[it_src_crit.first].good_flows = 1;
-            src_criterion[it_src_crit.first].prev_counter = src_criterion[it_src_crit.first].curr_counter;
-            src_criterion[it_src_crit.first].curr_counter = 1;
-            attack_end[it_src_crit.first].prev_counter=src_criterion[it_src_crit.first].prev_counter;
-            attack_end[it_src_crit.first].curr_counter=src_criterion[it_src_crit.first].curr_counter;
+void collectStatsModule::clean(){
+    if (stats_.size()) {
+        for (auto itSW=stats_.begin(); itSW!=stats_.end(); itSW++){
+            for (auto itPort=itSW->second.ports.begin(); itPort!=itSW->second.ports.end(); itPort++) {
+                itPort->second.gamma_per_tau = 0;
+            }
         }
-    }
-    //ADD NEW STATISTIC
-    
-    for (auto it : flow_stats){
-        of13::FlowStats *flow1 = static_cast<of13::FlowStats *>(&it);
-        of13::Match match = flow1->match();
-        std::string mac, ip;
-        if (match.eth_src())
-            mac = match.eth_src()->value().to_string();
-        if (match.ipv4_src()) {
-            ip = boost::lexical_cast<std::string>(ipv4addr(match.ipv4_src()->value().getIPv4()));
-        }
-        std::string key = "MAC " + mac + " IP " + ip;
-        if (src_criterion.find(key) != src_criterion.end()){
-            src_criterion[key].all_flows += 1;
-            if (it.packet_count() > unsigned(crit_good_flows)){
-                src_criterion[key].good_flows += 1;
+        bool isBigInterval = (current_time % (big_t)) ? false : true;
+        bool isCommonInterval = (current_time % (common_t)) ? false : true;
+        if (isBigInterval) sumLambda = 0;
+        if (isCommonInterval) {
+            sumBeta = 0;
+            for (auto itSW=stats_.begin(); itSW!=stats_.end(); itSW++){
+                itSW->second.beta = 0;
+                if (isBigInterval) itSW->second.lambda = 0;
+                for (auto itPort=itSW->second.ports.begin(); itPort!=itSW->second.ports.end(); itPort++) {
+                    itPort->second.gamma = 0;
+                }
             }
         }
     }
-    
 }
 
-void DDoS_Defender::send_init_flowmods(){
-
-    for (auto it_switch : switches){
-        //DROP ACTIONS
-        
-        for (auto host_port : it_switch.second.user){
-            uint16_t priority = 2;
-
-            of13::FlowMod fm1, fm2;
-            fm1.command(of13::OFPFC_ADD); fm2.command(of13::OFPFC_ADD);
-            fm1.xid(0); fm2.xid(0);
-            fm1.buffer_id(OFP_NO_BUFFER); fm2.buffer_id(OFP_NO_BUFFER);
-            fm1.table_id(0); fm2.table_id(0);
-            fm1.priority(priority); fm2.priority(priority);
-            fm1.cookie(0x0); fm2.cookie(0x0);
-            fm1.idle_timeout(0); fm2.idle_timeout(0);
-            fm1.hard_timeout(0); fm2.hard_timeout(0);
-            fm1.flags( of13::OFPFF_SEND_FLOW_REM );
-            fm2.flags( of13::OFPFF_SEND_FLOW_REM );
-            fm1.add_oxm_field(new of13::EthType(0x0800));
-            fm2.add_oxm_field(new of13::EthType(0x0806));
-            fm1.add_oxm_field(new of13::InPort(host_port));
-            fm2.add_oxm_field(new of13::InPort(host_port));
-            sender_->send(it_switch.first, fm1);
-            sender_->send(it_switch.first, fm2);
-        }
-        
-        //GOTOTABLE ACTIONS FOR TRUSTED PORTS
-        for (auto trust_port : it_switch.second.trusted){
-            of13::FlowMod fm;
-            fm.command(of13::OFPFC_ADD);
-            fm.xid(0);
-            fm.buffer_id(OFP_NO_BUFFER);
-            fm.table_id(0);
-            fm.priority(2);
-            fm.cookie(0x0);
-            fm.idle_timeout(0);
-            fm.hard_timeout(0);
-            fm.flags( of13::OFPFF_CHECK_OVERLAP | of13::OFPFF_SEND_FLOW_REM );
-            fm.add_oxm_field(new of13::InPort(trust_port));
-            of13::GoToTable go_to_table(1);
-            fm.add_instruction(go_to_table);
-            sender_->send(it_switch.first, fm);
-        }
-    }
-
-    //GOTOTABLE ACTIONS
-    for (auto it_BindTable : IPBindTable) {
-        uint16_t priority = 3;
-
-        of13::FlowMod fm1, fm2;
-        std::stringstream ss;
-        fm1.command(of13::OFPFC_ADD); fm2.command(of13::OFPFC_ADD);
-        fm1.xid(0); fm2.xid(0);
-        fm1.buffer_id(OFP_NO_BUFFER); fm2.buffer_id(OFP_NO_BUFFER);
-        fm1.table_id(0); fm2.table_id(0);
-        fm1.priority(priority); fm2.priority(priority);
-        fm1.cookie(0x0); fm2.cookie(0x0);
-        fm1.idle_timeout(uint64_t(600)); fm2.idle_timeout(uint64_t(600));
-        fm1.hard_timeout(uint64_t(0)); fm2.hard_timeout(uint64_t(0));
-        fm1.flags( of13::OFPFF_SEND_FLOW_REM ); fm2.flags( of13::OFPFF_SEND_FLOW_REM );
-        fm1.add_oxm_field(new of13::EthType(0x0800)); fm2.add_oxm_field(new of13::EthType(0x0806));
-        fm1.add_oxm_field(new of13::InPort(it_BindTable.second.switch_port));
-        fm2.add_oxm_field(new of13::InPort(it_BindTable.second.switch_port));
-
-        ethaddr eth_src(it_BindTable.second.mac);
-        ss.str(std::string());
-        ss.clear();
-        ss << eth_src;
-        fm1.add_oxm_field(new of13::EthSrc{fluid_msg::EthAddress(ss.str())});
-        fm2.add_oxm_field(new of13::EthSrc{fluid_msg::EthAddress (ss.str())});
-
-        ipv4addr ipv4_src(convert(it_BindTable.second.ip).first);
-        ss.str(std::string());
-        ss.clear();
-        ss << ipv4_src;
-        fm1.add_oxm_field(new of13::IPv4Src{fluid_msg::IPAddress (ss.str())});
-        of13::GoToTable go_to_table(1);
-        fm1.add_instruction(go_to_table);
-        fm2.add_instruction(go_to_table);
-        sender_->send(it_BindTable.second.switch_id, fm1);
-        sender_->send(it_BindTable.second.switch_id, fm2);
-    }
-    
-}
-
-void DDoS_Defender::send_drop_flowmod(uint64_t sw_id, uint32_t port_no){
+void controlFilterModule::add_filtered_flows(OFMsgSender* sender, 
+                                                    std::string MAC, std::string IP, uint64_t sw_id, uint32_t port) {
+    //DROP ACTIONS
+    uint16_t priority = 2;
 
     of13::FlowMod fm1, fm2;
     fm1.command(of13::OFPFC_ADD); fm2.command(of13::OFPFC_ADD);
     fm1.xid(0); fm2.xid(0);
     fm1.buffer_id(OFP_NO_BUFFER); fm2.buffer_id(OFP_NO_BUFFER);
     fm1.table_id(0); fm2.table_id(0);
-    fm1.priority(40); fm2.priority(40);
-    fm1.cookie(0x0); fm2.cookie(0x0);
+    fm1.priority(priority); fm2.priority(priority);
+    fm1.cookie(0x2); fm2.cookie(0x2);
     fm1.idle_timeout(0); fm2.idle_timeout(0);
     fm1.hard_timeout(0); fm2.hard_timeout(0);
-    fm1.flags( of13::OFPFF_CHECK_OVERLAP | of13::OFPFF_SEND_FLOW_REM );
-    fm2.flags( of13::OFPFF_CHECK_OVERLAP | of13::OFPFF_SEND_FLOW_REM );
+    fm1.flags( of13::OFPFF_SEND_FLOW_REM ); fm2.flags( of13::OFPFF_SEND_FLOW_REM );
+    fm1.add_oxm_field(new of13::EthType(0x0800)); fm2.add_oxm_field(new of13::EthType(0x0806));
+    fm1.add_oxm_field(new of13::InPort(port)); fm2.add_oxm_field(new of13::InPort(port));
+    sender->send(sw_id, fm1); sender->send(sw_id, fm2);
+    
+    
+    //GOTOTABLE ACTIONS
+    priority = 3;
+
+    of13::FlowMod fm3, fm4;
+    std::stringstream ss;
+    fm3.command(of13::OFPFC_ADD); fm4.command(of13::OFPFC_ADD);
+    fm3.xid(3); fm4.xid(3);
+    fm3.buffer_id(OFP_NO_BUFFER); fm4.buffer_id(OFP_NO_BUFFER);
+    fm3.table_id(0); fm4.table_id(0);
+    fm3.priority(priority); fm4.priority(priority);
+    fm3.cookie(0x3); fm4.cookie(0x3);
+    fm3.idle_timeout(uint64_t(0)); fm4.idle_timeout(uint64_t(0));
+    fm3.hard_timeout(uint64_t(0)); fm4.hard_timeout(uint64_t(0));
+    fm3.flags( of13::OFPFF_SEND_FLOW_REM ); fm4.flags( of13::OFPFF_SEND_FLOW_REM );
+    fm3.add_oxm_field(new of13::EthType(0x0800)); fm4.add_oxm_field(new of13::EthType(0x0806));
+    fm3.add_oxm_field(new of13::InPort(port)); fm4.add_oxm_field(new of13::InPort(port));
+
+    ethaddr eth_src(MAC);
+    ss.str(std::string());
+    ss.clear();
+    ss << eth_src;
+    fm3.add_oxm_field(new of13::EthSrc{fluid_msg::EthAddress(ss.str())});
+    fm4.add_oxm_field(new of13::EthSrc{fluid_msg::EthAddress (ss.str())});
+
+    ipv4addr ipv4_src(convert(IP).first);
+    ss.str(std::string());
+    ss.clear();
+    ss << ipv4_src;
+    fm3.add_oxm_field(new of13::IPv4Src{fluid_msg::IPAddress (ss.str())});
+
+    of13::GoToTable go_to_table(1);
+    fm3.add_instruction(go_to_table);
+    fm4.add_instruction(go_to_table);
+    sender->send(sw_id, fm3);
+    sender->send(sw_id, fm4);
+}
+
+void controlFilterModule::delete_old_flows(OFMsgSender* sender, 
+                                                    std::string MAC, std::string IP, uint64_t sw_id, uint32_t port) {                                                
+    //DROP ACTIONS
+    uint16_t priority = 2;
+
+    of13::FlowMod fm1, fm2;
+    fm1.command(of13::OFPFC_DELETE); fm2.command(of13::OFPFC_DELETE);
+    fm1.xid(2); fm2.xid(2);
+    fm1.buffer_id(OFP_NO_BUFFER); fm2.buffer_id(OFP_NO_BUFFER);
+    fm1.table_id(0); fm2.table_id(0);
+    fm1.priority(priority); fm2.priority(priority);
+    fm1.cookie(0x2); fm2.cookie(0x2);
+    fm1.idle_timeout(0); fm2.idle_timeout(0);
+    fm1.hard_timeout(0); fm2.hard_timeout(0);
+    fm1.flags( of13::OFPFF_SEND_FLOW_REM );
+    fm2.flags( of13::OFPFF_SEND_FLOW_REM );
     fm1.add_oxm_field(new of13::EthType(0x0800));
     fm2.add_oxm_field(new of13::EthType(0x0806));
-    fm1.add_oxm_field(new of13::InPort(port_no));
-    fm2.add_oxm_field(new of13::InPort(port_no));
+    fm1.add_oxm_field(new of13::InPort(port));
+    fm2.add_oxm_field(new of13::InPort(port));
+    sender->send(sw_id, fm1);
+    sender->send(sw_id, fm2);
+    
+
+    //GOTOTABLE ACTIONS
+    priority = 3;
+
+    of13::FlowMod fm3, fm4;
+    std::stringstream ss;
+    fm3.command(of13::OFPFC_DELETE); fm4.command(of13::OFPFC_DELETE);
+    fm3.xid(3); fm4.xid(3);
+    fm3.buffer_id(OFP_NO_BUFFER); fm4.buffer_id(OFP_NO_BUFFER);
+    fm3.table_id(0); fm4.table_id(0);
+    fm3.priority(priority); fm4.priority(priority);
+    fm3.cookie(0x3); fm4.cookie(0x3);
+    fm3.idle_timeout(uint64_t(0)); fm4.idle_timeout(uint64_t(0));
+    fm3.hard_timeout(uint64_t(0)); fm4.hard_timeout(uint64_t(0));
+    fm3.flags( of13::OFPFF_SEND_FLOW_REM ); fm4.flags( of13::OFPFF_SEND_FLOW_REM );
+    fm3.add_oxm_field(new of13::EthType(0x0800)); fm4.add_oxm_field(new of13::EthType(0x0806));
+    fm3.add_oxm_field(new of13::InPort(port)); fm4.add_oxm_field(new of13::InPort(port));
+
+    ethaddr eth_src(MAC);
+    ss.str(std::string());
+    ss.clear();
+    ss << eth_src;
+    fm3.add_oxm_field(new of13::EthSrc{fluid_msg::EthAddress(ss.str())});
+    fm4.add_oxm_field(new of13::EthSrc{fluid_msg::EthAddress (ss.str())});
+
+    ipv4addr ipv4_src(convert(IP).first);
+    ss.str(std::string());
+    ss.clear();
+    ss << ipv4_src;
+    fm3.add_oxm_field(new of13::IPv4Src{fluid_msg::IPAddress (ss.str())});
+
+    of13::GoToTable go_to_table(1);
+    fm3.add_instruction(go_to_table);
+    fm4.add_instruction(go_to_table);
+    sender->send(sw_id, fm3);
+    sender->send(sw_id, fm4);
+}
+
+void DDoS_Defender::send_drop_flows(uint64_t sw_id, uint32_t port) {
+    LOG(INFO) << "SEND DROP FLOWS to SW=" << sw_id << " : port=" << port;
+    of13::FlowMod fm1, fm2;
+    fm1.command(of13::OFPFC_ADD); fm2.command(of13::OFPFC_ADD);
+    fm1.xid(0); fm2.xid(0);
+    fm1.buffer_id(OFP_NO_BUFFER); fm2.buffer_id(OFP_NO_BUFFER);
+    fm1.table_id(0); fm2.table_id(0);
+    fm1.priority(4); fm2.priority(4);
+    fm1.cookie(0x4); fm2.cookie(0x4);
+    fm1.idle_timeout(60); fm2.idle_timeout(60);
+    fm1.hard_timeout(0); fm2.hard_timeout(0);
+    fm1.flags( of13::OFPFF_SEND_FLOW_REM );
+    fm2.flags( of13::OFPFF_SEND_FLOW_REM );
+    fm1.add_oxm_field(new of13::EthType(0x0800));
+    fm2.add_oxm_field(new of13::EthType(0x0806));
+    fm1.add_oxm_field(new of13::InPort(port));
+    fm2.add_oxm_field(new of13::InPort(port));
     sender_->send(sw_id, fm1);
     sender_->send(sw_id, fm2);
 }
 
-void DDoS_Defender::get_flow_stats(){
-    for (auto it : switches){
-        of13::MultipartRequestFlow mprf;
-        mprf.table_id(of13::OFPTT_ALL);
-        mprf.out_port(of13::OFPP_ANY);
-        mprf.out_group(of13::OFPG_ANY);
-        mprf.cookie(0x0);
-        mprf.cookie_mask(0x0);
-        mprf.flags(0);
-        sender_->send(it.first, mprf);
+void controlFilterModule::getFlowStats(OFMsgSender* sender){
+    for (auto it : switches_){
+        if (it.second.isEdge == true) {
+            of13::MultipartRequestFlow mprf;
+            mprf.table_id(of13::OFPTT_ALL);
+            mprf.out_port(of13::OFPP_ANY);
+            mprf.out_group(of13::OFPG_ANY);
+            mprf.cookie(0x0);
+            mprf.cookie_mask(0x0);
+            mprf.flags(0);
+            sender->send(it.first, mprf);
+        }
     }
-    bool is_filled = true;
+    /*bool is_filled = true;
     for (auto it : sw_response) {
         if (it.second == false) {
             is_filled = false;
@@ -510,282 +1400,61 @@ void DDoS_Defender::get_flow_stats(){
         for (auto it = sw_response.begin(); it != sw_response.end(); it++) {
             it->second = false;
         }
+    }*/
+}
+
+void DDoS_Defender::printBindingTable(){
+    LOG(INFO) << "BINDING TABLE (size = " << BindingTable_.size() << ") :";
+    for (auto it : BindingTable_) {
+        LOG(INFO) << it.first << " : " << it.second.getStrIP() << " : dpid=" 
+                    << it.second.DPID << " : port=" << it.second.PortNo << " : status=" 
+                    << it.second.Status << " : isHost=" << it.second.isHost;
     }
 }
 
-void DDoS_Defender::check_src_criterion(uint64_t sw_id){
-    for (auto it : src_criterion){
-        if (src_criterion[it.first].host.switch_id == sw_id) {
-             std::string key = it.first;
-            if (src_criterion[key].type == "INFECTED"){
-                continue;
-            }
-            if (src_criterion[key].all_flows != 0) {
-                src_criterion[key].crit = src_criterion[key].good_flows / src_criterion[key].all_flows;
-            }
-            else {
-                src_criterion[key].crit = threshold_hight;
-            }
-            float curr_score;
-            if (src_criterion[key].prev_counter != 0) {
-                curr_score = src_criterion[key].crit / src_criterion[key].prev_counter;
-            }
-            else {
-                curr_score = threshold_hight;
-            }
-            curr_score = (1 - alpha) * curr_score + alpha*it.second.prev_score;
-            src_criterion[key].prev_score = curr_score;
-            if ((curr_score < threshold_low)) {
-                LOG(INFO) << key << " (threshold)=>modif_curr_score " << curr_score << " INFECTED";
-                //DELETE FROM USER GROUP AND ADD TO INFECTED
-                if (src_criterion[key].type == "USER") {
-                    switches[it.second.host.switch_id].user.erase(it.second.host.switch_port);
-                }
-                else if (src_criterion[key].type == "AMBIGUOUS") {
-                    switches[it.second.host.switch_id].ambiguous.erase(it.second.host.switch_port);
-                }
-                switches[it.second.host.switch_id].infected.insert(it.second.host.switch_port);
-                src_criterion[key].type = "INFECTED";
-                //DROP PACKETS FROM SRC
-                send_drop_flowmod(it.second.host.switch_id, it.second.host.switch_port);
-            }
-            else if ((curr_score < threshold_hight)
-                    && (src_criterion[key].type != "AMBIGUOUS")) {
-                //DELETE FROM USER GROUP
-                if (src_criterion[key].type == "USER") {
-                    switches[it.second.host.switch_id].user.erase(it.second.host.switch_port);
-                }
-                if (cpu_util > threshold_cpu_util) {
-                    LOG(INFO) << key << " (cpu_util=" << cpu_util << ", threshold=" << threshold_cpu_util << ")=>modif_curr_score " << curr_score << " INFECTED";
-                    if (src_criterion[key].type == "AMBIGUOUS") {
-                        switches[it.second.host.switch_id].ambiguous.erase(it.second.host.switch_port);
-                    }
-                    //ADD TO INFECTED
-                    src_criterion[key].type = "INFECTED";
-                    switches[it.second.host.switch_id].infected.insert(it.second.host.switch_port);
-                    //DROP PACKETS FROM SRC
-                    send_drop_flowmod(it.second.host.switch_id, it.second.host.switch_port);
-                }
-                else {
-                    LOG(INFO) << key << " (cpu_util=" << cpu_util << ", threshold=" << threshold_cpu_util << ")=>modif_curr_score " << curr_score << " AMBIGUOUS";
-                    //ADD TO AMBIGUOUS
-                    switches[it.second.host.switch_id].ambiguous.insert(it.second.host.switch_port);
-                    src_criterion[key].type = "AMBIGUOUS";
-                }
-            }
-            else if ((curr_score >= threshold_hight)
-                     && (src_criterion[key].type != "USER")) {
-                LOG(INFO) << key << " modif_curr_score " << curr_score << " USER";
-                //DELETE FROM ANBIGUOUS GROUP AND ADD TO USER
-                switches[it.second.host.switch_id].ambiguous.erase(it.second.host.switch_port);
-                switches[it.second.host.switch_id].user.insert(it.second.host.switch_port);
-                src_criterion[key].type = "USER";
-            }
+void controlFilterModule::printSwitches(){
+    LOG(INFO) << "SWITCHES (size = " << switches_.size() << ") :";
+    for (auto it : switches_) {
+        LOG(INFO) << it.first << " : status=" << it.second.Status << " : isEdge=" << it.second.isEdge;
+        std::string user_ports = "user_ports (size = " + boost::lexical_cast<std::string>(it.second.ports.users.size()) + ") : ";
+        for (auto itPort : it.second.ports.users) {
+            user_ports += boost::lexical_cast<std::string>(itPort.first) + ":" 
+                        + boost::lexical_cast<std::string>(itPort.second) + ", ";
         }
-    }
-}
+        LOG(INFO) << user_ports;
 
-void DDoS_Defender::check_attack_end(){
-    bool end=true;
-    for (auto it : attack_end){
-        if ((it.second.curr_counter > THRESHOLD) || (it.second.prev_counter > THRESHOLD)) {
-            end = false;
-            break;
+        std::string trusted_ports = "trusted_ports (size = " + boost::lexical_cast<std::string>(it.second.ports.trusted.size()) + ") : ";
+        for (auto itPort : it.second.ports.trusted) {
+            trusted_ports += boost::lexical_cast<std::string>(itPort.first) + ":" 
+                            + boost::lexical_cast<std::string>(itPort.second) + ", ";
         }
-    }
-    if (end) {
-        ATTACK = false;
-        LOG(INFO) << "END OF THE ATTACK";
-        print_ports();
-    }
-}
+        LOG(INFO) << trusted_ports;
 
-//FOR TESTING
-/*
-flow_stat::flow_stat(){
-    this->inf_count=0;
-    this->usr_count=0;
-    this->stats = {};
-    this->done = false;
-}
-
-void DDoS_Defender::add_flow_statistic_from_switch(std::vector<of13::FlowStats> flow_stats, uint64_t sw_id){
-    switch_flow_test[sw_id].inf_count = 0;
-    switch_flow_test[sw_id].usr_count = 0;
-    for (auto flow : flow_stats){
-        std::string mac, ip;
-        if (flow.match().eth_src())
-            mac = flow.match().eth_src()->value().to_string();
-        for (auto it : src_criterion) {
-            if (it.second.host.mac == mac) {
-                if (it.second.type == "INFECTED")
-                    switch_flow_test[sw_id].inf_count+=1;
-                else if (it.second.type == "USER")
-                    switch_flow_test[sw_id].usr_count+=1;
-            }
+        std::string unknown_ports = "unknown_ports (size = " + boost::lexical_cast<std::string>(it.second.ports.unknown.size()) + ") : ";
+        for (auto itPort : it.second.ports.unknown) {
+            unknown_ports += boost::lexical_cast<std::string>(itPort.first) + ":" 
+                            + boost::lexical_cast<std::string>(itPort.second) + ", ";
         }
-    }
-    switch_flow_test[sw_id].stats = flow_stats;
-    switch_flow_test[sw_id].done = true;
-    int index = 0;
-    for (auto flow : flow_stats){
-        LOG(INFO) << "flow " << index
-                  << ", table id: " << unsigned(flow.table_id())
-                  << ", priority: " << flow.priority()
-                  << " idle_to: " << flow.idle_timeout()
-                  << ", hard_to: " << flow.hard_timeout()
-                  << ", packet count: " << flow.packet_count();
-        std::string eth_src = "", ip_src = "", eth_dst = "", ip_dst = "";
-        uint32_t in_port = 0;
-        
-        if (flow.match().eth_src()) eth_src = flow.match().eth_src()->value().to_string();
-        if (flow.match().ipv4_src()) ip_src = boost::lexical_cast<std::string>(
-                                            ipv4addr(flow.match().ipv4_src()->value().getIPv4()));
-        if (flow.match().eth_dst()) eth_dst = flow.match().eth_dst()->value().to_string();
-        if (flow.match().ipv4_dst()) ip_dst = boost::lexical_cast<std::string>(
-                                            ipv4addr(flow.match().ipv4_dst()->value().getIPv4()));
-        if (flow.match().in_port()) in_port = flow.match().in_port()->value();
-        LOG(INFO) << "      MACSrc=" << eth_src << " IPSrc=" << ip_src << " InPort=" << in_port
-                  << " MACDst=" << eth_dst << " IPDst=" << ip_dst << std::endl;
-        index++;
-    }
-}
-*/
-
-//PRINTING FUNCTIONS
-
-void DDoS_Defender::print_hosts(){
-    LOG(INFO) << "hosts (size = " << hosts.size() <<") :";
-    for (auto it : hosts){
-        LOG(INFO) << "IP: " << it.ip << " MAC: " << it.mac << " sw: " << it.switch_id << " port " << it.switch_port;
+        LOG(INFO) << unknown_ports;
     }
 }
 
-void DDoS_Defender::print_rev_ip_table(){
-    LOG(INFO) << "RevIPBindTable (size = " << RevIPBindTable.size() <<") :";
-    for (auto it : RevIPBindTable){
-        LOG(INFO) << "IP: " << it.second.ip << " MAC: " << it.second.mac
-                  << " sw: " << it.second.switch_id << " port: " << it.second.switch_port;
-    }
-}
-
-void DDoS_Defender::print_ip_table(){
-    LOG(INFO) << "IPBindTable (size = " << IPBindTable.size() <<") :";
-    for (auto it : IPBindTable){
-        LOG(INFO) << it.first << ", sw_id: " << it.second.switch_id
-                  << ", port_no " << it.second.switch_port;
-    }
-}
-
-void DDoS_Defender::print_ports(){
-    LOG(INFO) << "Switches and port's set (size = " << switches.size() <<") :";
-    for (auto it_sw_id : switches){
-        std::string trust = "";
-        for (auto it_t_p : it_sw_id.second.trusted){
-            trust += std::to_string(it_t_p) + " ";
+void collectStatsModule::printStats(){
+    LOG(INFO) << "STATS (size = " << stats_.size() << ") :";
+    for (auto itSW : stats_) {
+        LOG(INFO) << "SW=" << itSW.first << " :: ports : ";
+        for (auto itPort : itSW.second.ports) {
+            LOG(INFO) << itPort.first << " :: gamma=" << itPort.second.gamma 
+                        << " : gamma_per_tau=" << itPort.second.gamma_per_tau
+                        << " : drop=" << itPort.second.drop
+                        << " : diff_drop=" << itPort.second.diff_drop 
+                        << " : PNF=" << itPort.second.PNF
+                        << " : score=" << itPort.second.score 
+                        << " : type=" << itPort.second.whatType();
         }
-        std::string user = "";
-        for (auto it_h_p : it_sw_id.second.user){
-            user += std::to_string(it_h_p) + " ";
-        }
-        std::string ambig = "";
-        for (auto it_a_p : it_sw_id.second.ambiguous){
-            ambig += std::to_string(it_a_p) + " ";
-        }
-        std::string infect = "";
-        for (auto it_i_p : it_sw_id.second.infected){
-            infect += std::to_string(it_i_p) + " ";
-        }
-
-        LOG(INFO) << "switch id " << it_sw_id.first << ", trusted ports: " << trust
-                  << ", user ports: " << user
-                  << ", ambiguous ports: " << ambig
-                  << ", infected ports: " << infect;
+        LOG(INFO) << "beta=" << itSW.second.beta << " : lambda=" << itSW.second.lambda << " : alpha=" << itSW.second.alpha;
     }
-}
-
-void DDoS_Defender::print_flow_stats(std::vector<of13::FlowStats> flow_stats){
-    int index = 0;
-    for (auto it : flow_stats){
-        of13::FlowStats *flow1 = static_cast<of13::FlowStats *>(&it);
-        of13::Match match = flow1->match();
-        std::string mac, ip;
-        LOG(INFO) << "flow " << index << " MAC " << mac << " IP " << ip
-                  << ", table id: " << unsigned(it.table_id())
-                  << " idle_to: " << it.idle_timeout()
-                  << ", hard_to: " << it.hard_timeout()
-                  << ", packet count: " << it.packet_count();
-        if (match.eth_type()) {
-            if (match.eth_type()->value() == 0x0800) {
-                std::string eth_src = "", ip_src = "", eth_dst = "", ip_dst = "";
-                uint32_t in_port = 0;
-                if (match.eth_src()) eth_src = match.eth_src()->value().to_string();
-                if (match.ipv4_src()) ip_src = boost::lexical_cast<std::string>(ipv4addr(match.ipv4_src()->value().getIPv4()));
-                if (match.eth_dst()) eth_dst = match.eth_dst()->value().to_string();
-                if (match.ipv4_dst()) ip_dst = boost::lexical_cast<std::string>(ipv4addr(match.ipv4_dst()->value().getIPv4()));
-                if (match.in_port()) in_port = match.in_port()->value();
-                LOG(INFO) << "      MACSrc=" << eth_src << " IPSrc=" << ip_src << " InPort=" << in_port
-                          << " MACDst=" << eth_dst << " IPDst=" << ip_dst << std::endl;
-            }
-        }
-        index++;
-    }
-}
-
-void DDoS_Defender::print_src_criterion(){
-    LOG(INFO) << "Src_criterion (size = " << src_criterion.size() <<") :";
-    for (auto it : src_criterion){
-        LOG(INFO) << it.first << " type " << it.second.type
-                  << " packet_in_counter (prev = " << it.second.prev_counter
-                  << ", curr = " << it.second.curr_counter << "), "
-                  << " crit " << it.second.crit
-                  << " score " << it.second.prev_score;
-    }
-}
-
-void DDoS_Defender::print_attack_end(){
-    LOG(INFO) << "Hosts_Crit (size = " << src_criterion.size() <<") :";
-    for (auto it : attack_end){
-        LOG(INFO) << it.first << " prev_counter " << it.second.prev_counter << " curr_counter " << it.second.curr_counter;
-    }
-}
-
-//HOST-INFO STRUCTURE
-host_info::host_info(std::string mac, std::string ip, uint32_t switch_port, uint64_t switch_id){
-    this->ip = ip;
-    this->mac = mac;
-    this->switch_port = switch_port;
-    this->switch_id = switch_id;
-}
-host_info::host_info(){
-    this->ip = "";
-    this->mac = "";
-    this->switch_port = 0;
-    this->switch_id = 0;
-}
-
-//PORT CLASSIFICATION STRUCTURE
-ports::ports() {
-    this->trusted = {};
-    this->user = {};
-    this->ambiguous = {};
-    this->infected = {};
-}
-
-//HOST'S SCORE STRUCTURE
-score::score(){
-    this->type = "USER";
-    this->prev_counter = 1;
-    this->curr_counter = 1;
-    this->good_flows = 1;
-    this->all_flows = 1;
-    this->crit = threshold_hight;
-    this->prev_score = threshold_hight;
-}
-
-counters::counters(){
-    this->curr_counter = 0;
-    this->prev_counter = 0;
+    LOG(INFO) << "numberSW=" << numberSW << " : sumBeta=" << sumBeta << " : sumLambda=" << sumLambda;
 }
 
 }

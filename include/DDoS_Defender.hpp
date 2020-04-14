@@ -5,6 +5,9 @@
 #include "api/Switch.hpp"
 #include "Loader.hpp"
 #include "HostManager.hpp"
+#include "DhcpServer.hpp"
+#include "LinkDiscovery.hpp"
+#include "SwitchManager.hpp"
 #include "OFMsgSender.hpp"
 
 #include "oxm/openflow_basic.hh"
@@ -14,112 +17,118 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <memory>
 
 
 namespace runos {
 
 namespace of13 = fluid_msg::of13;
 
-struct host_info {
-    host_info(std::string, std::string, uint32_t, uint64_t);
-    host_info();
-    std::string mac;
-    std::string ip;
-    uint32_t switch_port;
-    uint64_t switch_id;
+enum Types {USR, AMB, INF};
+
+class controlFilterModule {
+public:
+    struct SWobj {
+        struct Ports {
+            std::unordered_map<uint32_t,bool> users;
+            std::unordered_map<uint32_t,bool> trusted;
+            std::unordered_map<uint32_t,bool> unknown;
+        } ports;
+        bool Status;
+        bool isEdge;
+
+        bool isAllPortsOff();
+
+        SWobj(bool, bool);
+    };
+
+    std::unordered_map<uint64_t,SWobj> switches_;
+    std::unordered_map<std::string,std::string> sw_port_to_MAC;
+
+    void add_filtered_flows(OFMsgSender*, std::string, std::string, uint64_t, uint32_t);
+    void delete_old_flows(OFMsgSender*, std::string, std::string, uint64_t, uint32_t);
+    void getFlowStats(OFMsgSender*);
+    void printSwitches();
+};
+
+class collectStatsModule {
+public:
+    struct statsPort {
+        int gamma, gamma_per_tau;
+        int drop, diff_drop;
+        float PNF, score;
+        Types type;
+        statsPort();
+        std::string whatType();
+    };
+    struct statsSW {
+        std::unordered_map<uint32_t, statsPort> ports;
+        int beta, alpha, lambda;
+        statsSW();
+    };
+    std::unordered_map<uint64_t,statsSW> stats_;
+    bool isAlphaExceed;
+    int numberSW;
+    int sumBeta, sumLambda;
+
+    collectStatsModule();
+    void comparison();
+    void clean();
+    void recount();
+    void printStats();
 };
 
 
-struct ports {
-    ports();
-    std::set<uint32_t> trusted;
-    std::set<uint32_t> user;
-    std::set<uint32_t> ambiguous;
-    std::set<uint32_t> infected;
-};
-
-
-struct score{
-    score();
-    host_info host;
-    std::string type;
-    float prev_counter;
-    float curr_counter;
-    float good_flows;
-    float all_flows;
-    float crit;
-    float prev_score;
-};
-
-
-struct counters{
-    counters();
-    int curr_counter;
-    int prev_counter;
-};
-
-//for testing
-/*struct flow_stat{
-    flow_stat();
-    int inf_count;
-    int usr_count;
-    std::vector<of13::FlowStats> stats;
-    bool done;
-};*/
 
 class DDoS_Defender : public Application {
     Q_OBJECT
     SIMPLE_APPLICATION(DDoS_Defender, "ddos-defender")
+public:
+    DDoS_Defender();
+    void init(Loader* loader, const Config& config) override;
+    void startUp(Loader*);
+    
+    struct BTinfo {
+        ethaddr MAC;
+        ipv4addr IP;
+        ipv4addr oldIP;
+        uint64_t DPID;
+        uint32_t PortNo;
+        bool Status;
+        bool isHost;
+
+        BTinfo(ethaddr, ipv4addr, ipv4addr, uint64_t, uint32_t, bool, bool);
+
+        std::string getStrMAC();
+        std::string getStrIP();
+    };
+protected slots:
+    void onHostDiscovered(Host* dev);
+    void onAddrChanged(Client* dev);
+    void onSwitchUp(SwitchPtr dev);
+    void onSwitchDown(SwitchPtr dev);
+    void onLinkUp(PortPtr dev);
+    void onLinkDown(PortPtr dev);
+    void onLinkDiscovered(switch_and_port from, switch_and_port to);
 private:
-    OFMessageHandlerPtr handler_, handler_flow_stats_;
 
     SwitchManager* switch_manager_;
     OFMsgSender* sender_;
-    std::vector<host_info> hosts;
-    std::unordered_map<std::string, host_info> RevIPBindTable;
-    std::unordered_map<std::string, host_info> IPBindTable;
-    std::unordered_map<uint64_t, ports> switches;
-    std::unordered_map<std::string, score> src_criterion;
-    std::unordered_map<std::string, counters> attack_end;
-    std::unordered_map<uint64_t, bool> sw_response;
-    
-    //std::unordered_map<uint64_t,flow_stat> switch_flow_test; //for testing
-
-    void add_to_RevTable(std::string, std::string, uint32_t, uint64_t);
-
-    void check_RevTable();
-
-    void build_IPBindTable();
-    void build_ports_set();
+    OFMessageHandlerPtr handler_, handler_flow_stats_, handler_flow_removed_;
 
     void get_cpu_util();
-    void get_flow_stats();
-
     void timerEvent(QTimerEvent*) override;
 
-    void send_init_flowmods();
-    void send_drop_flowmod(uint64_t, uint32_t);
+    std::unique_ptr<controlFilterModule> CFModPtr;
+    std::unique_ptr<collectStatsModule> CSModPtr;
+    std::unordered_map<std::string,BTinfo> BindingTable_;
+    std::unordered_set<std::string> infectedMACs_;
+    void checkScore();
+    void send_drop_flows(uint64_t,uint32_t);
+    void clearTables();
+    void trackINFHosts();
+    void printBindingTable();
 
-    //for testing
-    //void add_flow_statistic_from_switch(std::vector<of13::FlowStats>, uint64_t);
-
-    void add_src_statistic_from_switch(std::vector<of13::FlowStats>, uint64_t);
-    void init_src_criterion();
-    void check_src_criterion(uint64_t);
-    void check_attack_end();
-
-    void print_ip_table();
-    void print_rev_ip_table();
-    void print_hosts();
-    void print_ports();
-    void print_flow_stats(std::vector<of13::FlowStats>);
-    void print_src_criterion();
-    void print_attack_end();
-    
-public:
-    void init(Loader* loader, const Config& config) override;
-    void startUp(Loader*);
-    struct implementation;
 };
 
 }
