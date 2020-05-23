@@ -9,6 +9,8 @@
 #include "LinkDiscovery.hpp"
 #include "SwitchManager.hpp"
 #include "OFMsgSender.hpp"
+#include "DatabaseConnector.hpp"
+#include <json.hpp>
 
 #include "oxm/openflow_basic.hh"
 #include "oxm/field_set.hh"
@@ -38,38 +40,47 @@ public:
         bool isEdge;
 
         bool isAllPortsOff();
+        nlohmann::json to_json();
 
         SWobj(bool, bool);
     };
 
     std::unordered_map<uint64_t,SWobj> switches_;
+    void save_switches_to_database(DatabaseConnector* dbc_);
+    void load_switches_from_database(DatabaseConnector* dbc_);
     std::unordered_map<std::string,std::string> sw_port_to_MAC;
 
     void add_filtered_flows(OFMsgSender*, std::string, std::string, uint64_t, uint32_t);
     void delete_old_flows(OFMsgSender*, std::string, std::string, uint64_t, uint32_t);
     void getFlowStats(OFMsgSender*);
+    int getNumUpSwitches();
     void printSwitches();
 };
 
 class collectStatsModule {
 public:
     struct statsPort {
-        int gamma, gamma_per_tau;
-        int drop, diff_drop;
+        int gamma_per_tau;
+        int drop, diff_drop, drop_0x4, diff_drop_0x4;
         float PNF, score;
+        bool isCheck;
         Types type;
-        statsPort();
+        statsPort(int,int,int,int,int,float,float,bool,std::string);
         std::string whatType();
     };
     struct statsSW {
         std::unordered_map<uint32_t, statsPort> ports;
-        int beta, alpha, lambda;
+        int beta, betaInf, alpha, lambda;
         statsSW();
     };
-    std::unordered_map<uint64_t,statsSW> stats_;
+
     bool isAlphaExceed;
     int numberSW;
     int sumBeta, sumLambda;
+
+    std::unordered_map<uint64_t,statsSW> stats_;
+    void save_stats_to_database(DatabaseConnector* dbc_);
+    void load_stats_from_database(DatabaseConnector* dbc_);
 
     collectStatsModule();
     void comparison();
@@ -83,6 +94,7 @@ public:
 class DDoS_Defender : public Application {
     Q_OBJECT
     SIMPLE_APPLICATION(DDoS_Defender, "ddos-defender")
+
 public:
     DDoS_Defender();
     void init(Loader* loader, const Config& config) override;
@@ -96,12 +108,13 @@ public:
         uint32_t PortNo;
         bool Status;
         bool isHost;
-
+        nlohmann::json to_json();
         BTinfo(ethaddr, ipv4addr, ipv4addr, uint64_t, uint32_t, bool, bool);
 
         std::string getStrMAC();
         std::string getStrIP();
     };
+
 protected slots:
     void onHostDiscovered(Host* dev);
     void onAddrChanged(Client* dev);
@@ -110,11 +123,14 @@ protected slots:
     void onLinkUp(PortPtr dev);
     void onLinkDown(PortPtr dev);
     void onLinkDiscovered(switch_and_port from, switch_and_port to);
-private:
+    void onRecovery();
+    void onPrimary();
 
+private:
     SwitchManager* switch_manager_;
     OFMsgSender* sender_;
-    OFMessageHandlerPtr handler_, handler_flow_stats_, handler_flow_removed_;
+    DatabaseConnector* db_connector_;
+    OFMessageHandlerPtr handler_, handler_flow_stats_, handler_flow_removed_, handler_flow_mod_;
 
     void get_cpu_util();
     void timerEvent(QTimerEvent*) override;
@@ -123,12 +139,26 @@ private:
     std::unique_ptr<collectStatsModule> CSModPtr;
     std::unordered_map<std::string,BTinfo> BindingTable_;
     std::unordered_set<std::string> infectedMACs_;
+    void save_BT_to_database();
+    void load_BT_from_database();
+    void clear_database();
     void checkScore();
     void send_drop_flows(uint64_t,uint32_t);
-    void clearTables();
+    void delete_all_flows(std::string);
+    void delete_drop_flows(uint64_t, uint32_t);
+    void cleanTables();
     void trackINFHosts();
     void printBindingTable();
-
+    void printInfectedMACs();
+    void printSwPortToMAC();
+    //for testing
+    //-----------------------------------
+    void checkTableUsage(std::unordered_map<std::string,int>);
+    std::unordered_set<std::string> infectedIPs_;
+    void fillInfectedMACs();
+    std::unordered_map<std::string,std::vector<int>> packetIns_;
+    std::unordered_map<std::string,std::vector<int>> packetDrops_;
+    void savedInfoForComputeFPFN();
 };
 
 }

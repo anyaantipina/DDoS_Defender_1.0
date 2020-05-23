@@ -1,5 +1,6 @@
 #include "DDoS_Defender.hpp"
 #include "PacketParser.hpp"
+#include "Recovery.hpp"
 
 #include <algorithm>
 #include <unistd.h>
@@ -10,6 +11,7 @@
 #include <stdexcept>
 #include <tins/ip.h>
 #include <cmath>
+#include <fstream>
 
 static clock_t lastCPU, lastSysCPU, lastUserCPU;
 
@@ -20,11 +22,14 @@ static float alpha, threshold_low, threshold_hight;
 static float cpu_util, threshold_cpu_util;
 int current_time, sw_response_number;
 int commonPNF;
-uint64_t numberClearTables;
+uint numberClearSW;
+bool isPacketsAmountSaved, computeFP_FN, startLogInfoForFPFN, computeTableUsage, appEnabled, logEnabled;
+int testDuration, currentTestTime;
 
 namespace runos {
 
-REGISTER_APPLICATION(DDoS_Defender, {"controller", "host-manager", "switch-manager",  "link-discovery", "dhcp-server", ""})
+REGISTER_APPLICATION(DDoS_Defender, {"controller", "host-manager", "switch-manager", 
+                                        "link-discovery", "dhcp-server", "recovery-manager", "database-connector", ""})
 
 std::string correct_ip_addr(std::string ip){
     std::vector<std::string> fragms;
@@ -126,14 +131,92 @@ bool controlFilterModule::SWobj::isAllPortsOff() {
     return allOff;
 }
 
-collectStatsModule::statsPort::statsPort() {
-    gamma = 0;
-    gamma_per_tau = 0;
-    drop = 0;
-    diff_drop = 0;
-    score = threshold_hight;
-    PNF = commonPNF;
-    type = USR;
+nlohmann::json controlFilterModule::SWobj::to_json() {
+    nlohmann::json ret = nlohmann::json::object();
+    auto jdump1 = nlohmann::json::array();
+    auto jdump2 = nlohmann::json::array();
+    auto jdump3 = nlohmann::json::array();
+    for (auto port : ports.users) {
+        nlohmann::json j = nlohmann::json::object();
+        j["port"] = port.first;
+        j["status"] = port.second;
+        jdump1.push_back(j);
+    }
+    for (auto port : ports.trusted) {
+        nlohmann::json j = nlohmann::json::object();
+        j["port"] = port.first;
+        j["status"] = port.second;
+        jdump2.push_back(j);
+    }
+    for (auto port : ports.unknown) {
+        nlohmann::json j = nlohmann::json::object();
+        j["port"] = port.first;
+        j["status"] = port.second;
+        jdump2.push_back(j);
+    }
+    ret["users"] = jdump1;
+    ret["trusted"] = jdump2;
+    ret["unknown"] = jdump3;
+    ret["Status"] = Status;
+    ret["isEdge"] = isEdge;
+    return ret;
+}
+
+void controlFilterModule::save_switches_to_database(DatabaseConnector* dbc_) {
+    if (!dbc_) return;
+    //LOG(INFO) << "save_switches_to_database";
+    if (switches_.size()) {
+        auto jdump = nlohmann::json::array();
+        for (auto sw : switches_) {
+            nlohmann::json j = nlohmann::json::object(); 
+            j["DPID"] = sw.first;
+            j["info"] = sw.second.to_json();
+            jdump.push_back(j);
+        }
+        dbc_->putSValue("ddos-defender", "switches", jdump.dump());
+    }
+}
+
+void controlFilterModule::load_switches_from_database(DatabaseConnector* dbc_) {
+    if (!dbc_) return;
+    //LOG(INFO) << "load_switches_from_database";
+    auto switches = dbc_->getSValue("ddos-defender", "switches");
+    if (switches.empty()) return;
+    auto switches_json = nlohmann::json::parse(switches);
+    switches_.clear();
+    for (const auto& elem_sw_json : switches_json) {
+        SWobj elemSW;
+        elemSW.Status = elem_sw_json["info"]["Status"];
+        elemSW.isEdge = elem_sw_json["info"]["isEdge"];
+        for (const auto& elem_port_json : elem_sw_json["info"]["users"]) {
+            elemSW.ports.users.emplace(elem_port_json["port"],elem_port_json["status"]);
+        }
+        for (const auto& elem_port_json : elem_sw_json["info"]["trusted"]) {
+            elemSW.ports.trusted.emplace(elem_port_json["port"],elem_port_json["status"]);
+        }
+        for (const auto& elem_port_json : elem_sw_json["info"]["unknown"]) {
+            elemSW.ports.unknown.emplace(elem_port_json["port"],elem_port_json["status"]);
+        }
+        switches_.emplace(elem_sw_json["DPID"], elemSW);
+    }
+}
+
+int controlFilterModule::getNumUpSwitches() {
+    int number=0;
+    for (auto it : switches_) {
+        if (it.second.Status) number++;
+    }
+    return number;
+}
+
+collectStatsModule::statsPort::statsPort
+    (int gpt=0, int dr=0, int ddr=0, int dr0x4=0, int ddr0x4=0, 
+        float sc=threshold_hight, float pnf=commonPNF, bool isch=false,std::string t="USR") :
+                                gamma_per_tau(gpt), drop(dr), diff_drop(ddr),drop_0x4(dr0x4), 
+                                diff_drop_0x4(ddr0x4), score(sc), PNF(pnf), isCheck(isch) {
+    if (t == "USR") type=USR;
+    if (t == "INF") type=INF;
+    if (t == "AMB") type=AMB;
 }
 
 std::string collectStatsModule::statsPort::whatType(){
@@ -145,8 +228,81 @@ std::string collectStatsModule::statsPort::whatType(){
     return "";
 }
 
+void collectStatsModule::save_stats_to_database(DatabaseConnector* dbc_) {
+    if (!dbc_) return;
+    //LOG(INFO) << "save_stats_to_database";
+    if (stats_.size()) {
+        auto jdump = nlohmann::json::array();
+        for (auto sw : stats_) {
+            nlohmann::json j = nlohmann::json::object();
+            j["DPID"] = sw.first;
+            j["beta"] = sw.second.beta;
+            j["betaInf"] = sw.second.betaInf;
+            j["alpha"] = sw.second.alpha;
+            j["lambda"] = sw.second.lambda;
+            auto jdump2 = nlohmann::json::array();
+            for (auto port : sw.second.ports) {
+                nlohmann::json j2 = nlohmann::json::object();
+                j2["port"] = port.first;
+                j2["gamma_per_tau"] = port.second.gamma_per_tau;
+                j2["drop"] = port.second.drop;
+                j2["diff_drop"] = port.second.diff_drop;
+                j2["drop_0x4"] = port.second.drop_0x4;
+                j2["diff_drop_0x4"] = port.second.diff_drop_0x4;
+                j2["PNF"] = port.second.PNF;
+                j2["score"] = port.second.score;
+                j2["isCheck"] = port.second.isCheck;
+                j2["type"] = port.second.whatType();
+                jdump2.push_back(j2);
+            }
+            j["ports"] = jdump2;
+            jdump.push_back(j);
+        }
+        nlohmann::json j = nlohmann::json::object();
+        j["isAlphaExceed"] = isAlphaExceed;
+        j["numberSW"] = numberSW;
+        j["sumBeta"] = sumBeta;
+        j["sumLambda"] = sumLambda;
+        j["switches"] = jdump.dump();
+        dbc_->putSValue("ddos-defender", "stats", j.dump());
+    }
+}
+
+void collectStatsModule::load_stats_from_database(DatabaseConnector* dbc_) {
+    if (!dbc_) return;
+    //LOG(INFO) << "load_stats_from_database";
+    auto stats = dbc_->getSValue("ddos-defender", "stats");
+    if (stats.empty()) return;
+    auto stats_json = nlohmann::json::parse(stats);
+    isAlphaExceed = stats_json["isAlphaExceed"];
+    numberSW = stats_json["numberSW"];
+    sumBeta = stats_json["sumBeta"];
+    sumLambda = stats_json["sumLambda"];
+    stats_.clear();
+    std::string switches = stats_json["switches"];
+    auto switches_json = nlohmann::json::parse(switches);
+    for (const auto& elem_sw_json : switches_json) {
+        statsSW elemSW;
+        elemSW.beta = elem_sw_json["beta"];
+        elemSW.betaInf = elem_sw_json["betaInf"];
+        elemSW.alpha = elem_sw_json["alpha"];
+        elemSW.lambda = elem_sw_json["lambda"];
+        auto ports = elem_sw_json["ports"];
+        for (const auto& elem_port_json : ports) {
+            statsPort elemPort(elem_port_json["gamma_per_tau"],
+                                elem_port_json["drop"], elem_port_json["diff_drop"],
+                                elem_port_json["drop_0x4"], elem_port_json["diff_drop_0x4"],
+                                elem_port_json["score"], elem_port_json["PNF"],
+                                elem_port_json["isCheck"], elem_port_json["type"]);
+            elemSW.ports.emplace(elem_port_json["port"], elemPort);
+        }
+        stats_.emplace(elem_sw_json["DPID"], elemSW);
+    }
+}
+
 collectStatsModule::statsSW::statsSW() {
     beta = 0;
+    betaInf = 0;
     lambda = 0;
     alpha = omega;
 }
@@ -158,14 +314,92 @@ collectStatsModule::collectStatsModule() {
     sumLambda = 0;
 }
 
+nlohmann::json DDoS_Defender::BTinfo::to_json() {
+    nlohmann::json ret = nlohmann::json::object();
+    ret["MAC"] = getStrMAC();
+    ret["IP"] = getStrIP();
+    ret["oldIP"] = boost::lexical_cast<std::string>(oldIP);
+    ret["DPID"] = DPID;
+    ret["PortNo"] = PortNo;
+    ret["Status"] = Status;
+    ret["isHost"] = isHost;
+    return ret;
+}
+
+void DDoS_Defender::save_BT_to_database() {
+    if (!db_connector_) return;
+    //LOG(INFO) << "save_BT_to_database";
+    if (BindingTable_.size()) {
+        auto jdump = nlohmann::json::array();
+        for (auto itBT : BindingTable_) {
+            jdump.push_back(itBT.second.to_json());
+        }
+        db_connector_->putSValue("ddos-defender", "binding-table", jdump.dump());
+    }
+}
+
+void DDoS_Defender::load_BT_from_database() {
+    if (!db_connector_) return;
+    //LOG(INFO) << "load_BT_from_database";
+    auto BT = db_connector_->getSValue("ddos-defender", "binding-table");
+    if (BT.empty()) return;
+    auto BT_json = nlohmann::json::parse(BT);
+    BindingTable_.clear();
+    for (const auto& elem_BT_json : BT_json) {
+        std::string MAC = elem_BT_json["MAC"], IP = elem_BT_json["IP"], oldIP = elem_BT_json["oldIP"];
+        uint64_t DPID = elem_BT_json["DPID"];
+        uint32_t PortNo = elem_BT_json["PortNo"];
+        bool Status = elem_BT_json["Status"], isHost = elem_BT_json["isHost"];
+        BTinfo elem(ethaddr(MAC), ipv4addr(convert(IP).first), ipv4addr(convert(oldIP).first), 
+                    DPID,PortNo, Status, isHost);
+        BindingTable_.emplace(MAC, elem);
+    }
+
+    CFModPtr->sw_port_to_MAC.clear();
+    for (auto itBT : BindingTable_) {
+        std::string sw_port = boost::lexical_cast<std::string>(itBT.second.DPID) + 
+                                boost::lexical_cast<std::string>(itBT.second.PortNo);
+        CFModPtr->sw_port_to_MAC.emplace(sw_port, itBT.first);
+    }
+    infectedMACs_.clear();
+    for (auto sw : CSModPtr->stats_) {
+        for (auto port : sw.second.ports) {
+            if (port.second.whatType() == "INF") {
+                std::string sw_port = boost::lexical_cast<std::string>(sw.first) + 
+                                    boost::lexical_cast<std::string>(port.first);
+                auto itMAC = CFModPtr->sw_port_to_MAC.find(sw_port);
+                if (itMAC != CFModPtr->sw_port_to_MAC.end())                   
+                    infectedMACs_.emplace(itMAC->first);
+            }
+        }
+        
+    }
+}
+
+void DDoS_Defender::clear_database()
+{
+    if (!db_connector_) return;
+    //LOG(INFO) << "clear database";
+    db_connector_->delPrefix("DDoS_Defender");
+}
+
+void DDoS_Defender::onRecovery() {
+    CFModPtr->load_switches_from_database(db_connector_);
+    CSModPtr->load_stats_from_database(db_connector_);
+    load_BT_from_database();
+}
+
+void DDoS_Defender::onPrimary() {
+    clear_database();
+}
+
 DDoS_Defender::DDoS_Defender() {
     CFModPtr = std::make_unique<controlFilterModule>();
     CSModPtr = std::make_unique<collectStatsModule>();
 }
 
 void DDoS_Defender::onHostDiscovered(Host* dev) {
-    //host_info host(dev->mac(), dev->ip(), dev->switchPort(), dev->switchID());
-    //CFModPtr->hosts.push_back(host);
+    startLogInfoForFPFN = true;
     if (dev->mac() != "00:00:00:00:00:00") {
         if (dev->ip() == "0.0.0.0") {
             BTinfo info(ethaddr(dev->mac()), convert("0.0.0.0").first, 
@@ -259,6 +493,11 @@ void DDoS_Defender::onHostDiscovered(Host* dev) {
                     //LOG(INFO) << "SWITCH " << dev->switchID() << " is EDGE";
                     CSModPtr->numberSW++;
 
+                    threshold_low = ( CFModPtr->getNumUpSwitches() > 0 ) ? 
+                                    1.0 / (tau*(CFModPtr->getNumUpSwitches()*2)) : 1.0 / tau;
+                    threshold_hight = float(commonPNF) / (tau*(CFModPtr->getNumUpSwitches()+1));
+                    LOG(INFO) << "TL=" << threshold_low << " TH=" << threshold_hight;
+
                     collectStatsModule::statsSW ssw;
                     CSModPtr->stats_.emplace(dev->switchID(), ssw);
                     //LOG(INFO) << "NUMBER OF EDGE SWITCHES IS " << CSModPtr->numberSW;
@@ -331,6 +570,11 @@ void DDoS_Defender::onAddrChanged(Client* dev) {
                     //LOG(INFO) << "SWITCH " << itBT->second.DPID << " is EDGE";
                     CSModPtr->numberSW++;
 
+                    threshold_low = ( CFModPtr->getNumUpSwitches() > 0 ) ? 
+                                    1.0 / (tau*(CFModPtr->getNumUpSwitches()*2)) : 1.0 / tau;
+                    threshold_hight = float(commonPNF) / (tau*(CFModPtr->getNumUpSwitches()+1));
+                    LOG(INFO) << "TL=" << threshold_low << " TH=" << threshold_hight;
+
                     collectStatsModule::statsSW ssw;
                     CSModPtr->stats_.emplace(itBT->second.DPID, ssw);
                     //LOG(INFO) << "NUMBER OF EDGE SWITCHES IS " << CSModPtr->numberSW;
@@ -341,6 +585,7 @@ void DDoS_Defender::onAddrChanged(Client* dev) {
                 LOG(INFO) << "the message came from a switch " << itBT->second.DPID << " that is not in switches_";
             }
             CFModPtr->delete_old_flows(sender_, MAC, itBT->second.getStrIP(), itBT->second.DPID, itBT->second.PortNo);
+            delete_all_flows(MAC);
             CFModPtr->add_filtered_flows(sender_, MAC, newIP, itBT->second.DPID, itBT->second.PortNo);
             itBT->second.IP = convert(newIP).first;
             itBT->second.Status = true;
@@ -360,6 +605,10 @@ void DDoS_Defender::onSwitchUp(SwitchPtr dev) {
             //LOG(INFO) << "SWITCH " << dev->dpid() << " UP";
             if (CFModPtr->switches_[dev->dpid()].isEdge == true) {
                 CSModPtr->numberSW++;
+                threshold_low = ( CFModPtr->getNumUpSwitches() > 0 ) ? 
+                                1.0 / (tau*(CFModPtr->getNumUpSwitches()*2)) : 1.0 / tau;
+                    threshold_hight = float(commonPNF) / (tau*(CFModPtr->getNumUpSwitches()+1));
+                    LOG(INFO) << "TL=" << threshold_low << " TH=" << threshold_hight;
                 //LOG(INFO) << "NUMBER OF EDGE SWITCHES IS " << CSModPtr->numberSW;
                 CSModPtr->recount();
             }
@@ -386,6 +635,10 @@ void DDoS_Defender::onSwitchDown(SwitchPtr dev) {
         //LOG(INFO) << "SWITCH " << dev->dpid() << " DOWN";
         if (itSW->second.isEdge) {
             CSModPtr->numberSW--;
+            threshold_low = ( CFModPtr->getNumUpSwitches() > 0 ) ?
+                            1.0 / (tau*(CFModPtr->getNumUpSwitches()*2)) : 1.0 / tau;
+            threshold_hight = float(commonPNF) / (tau*(CFModPtr->getNumUpSwitches()+1));
+            LOG(INFO) << "TL=" << threshold_low << " TH=" << threshold_hight;
             CSModPtr->recount();
         }
     }
@@ -412,6 +665,12 @@ void DDoS_Defender::onLinkUp(PortPtr dev) {
                 //LOG(INFO) << "SWITCH " << dev->switch_()->dpid() << " UP";
                 if (CFModPtr->switches_[dev->switch_()->dpid()].isEdge == true) {
                     CSModPtr->numberSW++;
+
+                    threshold_low = ( CFModPtr->getNumUpSwitches() > 0 ) ? 
+                                    1.0 / (tau*(CFModPtr->getNumUpSwitches()*2)) : 1.0 / tau;
+                    threshold_hight = float(commonPNF) / (tau*(CFModPtr->getNumUpSwitches()+1));
+                    LOG(INFO) << "TL=" << threshold_low << " TH=" << threshold_hight;
+
                     //LOG(INFO) << "NUMBER OF EDGE SWITCHES IS " << CSModPtr->numberSW;
                     CSModPtr->recount();
                 }
@@ -427,6 +686,12 @@ void DDoS_Defender::onLinkUp(PortPtr dev) {
                     //LOG(INFO) << "SWITCH " << dev->switch_()->dpid() << " UP";
                     if (CFModPtr->switches_[dev->switch_()->dpid()].isEdge == true) {
                         CSModPtr->numberSW++;
+
+                        threshold_low = ( CFModPtr->getNumUpSwitches() > 0 ) ? 
+                                        1.0 / (tau*(CFModPtr->getNumUpSwitches()*2)) : 1.0 / tau;
+                        threshold_hight = float(commonPNF) / (tau*(CFModPtr->getNumUpSwitches()+1));
+                        LOG(INFO) << "TL=" << threshold_low << " TH=" << threshold_hight;
+                        
                         //LOG(INFO) << "NUMBER OF EDGE SWITCHES IS " << CSModPtr->numberSW;
                         CSModPtr->recount();
                     }
@@ -448,6 +713,12 @@ void DDoS_Defender::onLinkUp(PortPtr dev) {
                     //LOG(INFO) << "SWITCH " << dev->switch_()->dpid() << " UP";
                     if (CFModPtr->switches_[dev->switch_()->dpid()].isEdge == true) {
                         CSModPtr->numberSW++;
+
+                        threshold_low = ( CFModPtr->getNumUpSwitches() > 0 ) ? 
+                                        1.0 / (tau*(CFModPtr->getNumUpSwitches()*2)) : 1.0 / tau;
+                        threshold_hight = float(commonPNF) / (tau*(CFModPtr->getNumUpSwitches()+1));
+                        LOG(INFO) << "TL=" << threshold_low << " TH=" << threshold_hight;
+
                         //LOG(INFO) << "NUMBER OF EDGE SWITCHES IS " << CSModPtr->numberSW;
                         CSModPtr->recount();
                     }
@@ -486,6 +757,7 @@ void DDoS_Defender::onLinkDown(PortPtr dev) {
                     }
                 }
                 CFModPtr->delete_old_flows(sender_, mac, ip, dev->switch_()->dpid(), dev->number());
+                delete_all_flows(mac);
                 //LOG(INFO) << "ON SWITCH " << dev->switch_()->dpid() << " USERS PORT " << dev->number() << " DOWN";
             }
             else {
@@ -507,12 +779,17 @@ void DDoS_Defender::onLinkDown(PortPtr dev) {
             //LOG(INFO) << "SWITCH " << dev->switch_()->dpid() << " DOWN";
             if (itSW->second.isEdge) {
                 CSModPtr->numberSW--;
+                threshold_low = ( CFModPtr->getNumUpSwitches() > 0 ) ? 
+                                1.0 / (tau*(CFModPtr->getNumUpSwitches()*2)) : 1.0 / tau;
+                threshold_hight = float(commonPNF) / (tau*(CFModPtr->getNumUpSwitches()+1));
+                LOG(INFO) << "TL=" << threshold_low << " TH=" << threshold_hight;
                 CSModPtr->recount();
             }
             if (BindingTable_.size() != 0) {
                 for (auto it = BindingTable_.begin(); it != BindingTable_.end(); it++) {
                     if (it->second.DPID == dev->switch_()->dpid()) {
                         it->second.Status = false;
+
                     }
                 }
             }
@@ -523,8 +800,15 @@ void DDoS_Defender::onLinkDown(PortPtr dev) {
     }
 
     std::string ss = boost::lexical_cast<std::string>(dev->switch_()->dpid()) + boost::lexical_cast<std::string>(dev->number());
-    if (CFModPtr->sw_port_to_MAC.find(ss) != CFModPtr->sw_port_to_MAC.end())
-        BindingTable_.find(CFModPtr->sw_port_to_MAC[ss])->second.Status = false;
+    if (CFModPtr->sw_port_to_MAC.find(ss) != CFModPtr->sw_port_to_MAC.end()) {
+        auto itBT = BindingTable_.find(CFModPtr->sw_port_to_MAC[ss]);
+        if (itBT != BindingTable_.end()) {
+            itBT->second.Status = false;
+            CFModPtr->delete_old_flows(sender_, itBT->second.getStrMAC(), 
+                        itBT->second.getStrIP(), itBT->second.DPID, itBT->second.PortNo);
+            delete_all_flows(itBT->second.getStrMAC());
+        }
+    } 
 }
 
 void DDoS_Defender::onLinkDiscovered(switch_and_port from, switch_and_port to) {
@@ -535,6 +819,10 @@ void DDoS_Defender::onLinkDiscovered(switch_and_port from, switch_and_port to) {
             //LOG(INFO) << "SWITCH " << from.dpid << " UP";
             if (CFModPtr->switches_[from.dpid].isEdge == true) {
                 CSModPtr->numberSW++;
+                threshold_low = ( CFModPtr->getNumUpSwitches() > 0 ) ? 
+                                1.0 / (tau*(CFModPtr->getNumUpSwitches()*2)) : 1.0 / tau;
+                threshold_hight = float(commonPNF) / (tau*(CFModPtr->getNumUpSwitches()+1));
+                LOG(INFO) << "TL=" << threshold_low << " TH=" << threshold_hight;
                 //LOG(INFO) << "NUMBER OF EDGE SWITCHES IS " << CSModPtr->numberSW;
                 CSModPtr->recount();
             }
@@ -578,6 +866,10 @@ void DDoS_Defender::onLinkDiscovered(switch_and_port from, switch_and_port to) {
             //LOG(INFO) << "SWITCH " << to.dpid << " UP";
             if (CFModPtr->switches_[to.dpid].isEdge == true) {
                 CSModPtr->numberSW++;
+                threshold_low = ( CFModPtr->getNumUpSwitches() > 0 ) ? 
+                                1.0 / (tau*(CFModPtr->getNumUpSwitches()*2)) : 1.0 / tau;
+                threshold_hight = float(commonPNF) / (tau*(CFModPtr->getNumUpSwitches()+1));
+                LOG(INFO) << "TL=" << threshold_low << " TH=" << threshold_hight;
                 //LOG(INFO) << "NUMBER OF EDGE SWITCHES IS " << CSModPtr->numberSW;
                 CSModPtr->recount();
             }
@@ -622,10 +914,29 @@ struct PortStatCount {
     int packets;
     int flows;
     bool from_LS;
+    int drop_0x4;
 
-    PortStatCount(uint64_t dpd=0, uint32_t prt=0, int dr=0, int pckt=0, int fls=0, bool fLS=false) : 
-                        dpid(dpd), port(prt), drop(dr), packets(pckt), flows(fls), from_LS(fLS) {}
+    PortStatCount(uint64_t dpd=0, uint32_t prt=0, int dr=0, int pckt=0, int fls=0, 
+                        bool fLS=false, int dr0x4=0) : 
+                        dpid(dpd), port(prt), drop(dr), packets(pckt), flows(fls), 
+                        from_LS(fLS), drop_0x4(dr0x4){}
 };
+
+//for testing
+//----------------------------------- 
+
+void DDoS_Defender::checkTableUsage(std::unordered_map<std::string,int> testStats) {
+    int infNum = 0, usrNum = 0;
+    for (auto mac : testStats) {
+        if (infectedMACs_.find(mac.first) != infectedMACs_.end()) {
+            infNum+=mac.second;
+        }
+        else usrNum+=mac.second;
+    }
+    float infPerc = ((infNum + usrNum) > 0) ? float(infNum) / (infNum + usrNum) : 0;
+    LOG(INFO) << "usrNum=" << usrNum << " : infNum=" << infNum << " : infPerc=" << infPerc;
+}
+//-----------------------------------
 
 
 void DDoS_Defender::init(Loader *loader, const Config &rootConfig){
@@ -639,14 +950,24 @@ void DDoS_Defender::init(Loader *loader, const Config &rootConfig){
     alpha = string_to_float(config_get(config, "alpha", "0.2").c_str());
     threshold_cpu_util = string_to_float(config_get(config, "TCU", "80.0").c_str());
     tau = config_get(config, "tau", 3);
-    common_t = tau*3;
-    big_t = common_t*3;
-    omega = 100;
+    int numForCommon = config_get(config, "k", 3);
+    int numForBig = 3;
+    testDuration = 60;
+    omega = 400;
+    common_t = tau*numForCommon;
+    big_t = common_t*numForBig;
     sw_response_number = 0;
     commonPNF = 5.0;
-    threshold_low = 1.0 / tau;
-    threshold_hight = float(commonPNF) / tau;
-    numberClearTables = 0;
+    threshold_low = 1.0 / (tau);
+    threshold_hight = float(commonPNF) / (tau);
+    numberClearSW = 0;
+    isPacketsAmountSaved = false;
+    computeTableUsage  = config_get(config, "computeTableUsage", false);
+    computeFP_FN = config_get(config, "computeFP_FN", false);
+    appEnabled  = config_get(config, "appEnabled", true);
+    logEnabled  = config_get(config, "logEnabled", false);
+    startLogInfoForFPFN = false;
+    currentTestTime = -tau;
     CLEAR = true;
 
     LOG(INFO) << "alpha = " << alpha;
@@ -655,6 +976,10 @@ void DDoS_Defender::init(Loader *loader, const Config &rootConfig){
     LOG(INFO) << "omega = " << omega;
     LOG(INFO) << "threshold_low = " << threshold_low;
     LOG(INFO) << "threshold_hight = " << threshold_hight;
+    LOG(INFO) << "computeTableUsage = " << computeTableUsage;
+    LOG(INFO) << "computeFP_FN = " << computeFP_FN;
+    LOG(INFO) << "appEnabled = " << appEnabled;
+    LOG(INFO) << "logEnabled = " << logEnabled;
 
     
 
@@ -665,6 +990,13 @@ void DDoS_Defender::init(Loader *loader, const Config &rootConfig){
     LinkDiscovery* link_discovery_ = dynamic_cast<LinkDiscovery*>(LinkDiscovery::get(loader));
     switch_manager_ = SwitchManager::get(loader);
     sender_ = OFMsgSender::get(loader);
+    db_connector_ = DatabaseConnector::get(loader);
+    RecoveryManager* recovery = RecoveryManager::get(loader);
+
+    //RECOVERY
+    QObject::connect(recovery, &RecoveryManager::signalRecovery, this, &DDoS_Defender::onRecovery);
+    
+    QObject::connect(recovery, &RecoveryManager::signalSetupPrimaryMode, this, &DDoS_Defender::onPrimary);
 
     //ADD HOSTS
     QObject::connect(host_manager_, &HostManager::hostDiscovered, this, &DDoS_Defender::onHostDiscovered);
@@ -712,13 +1044,28 @@ void DDoS_Defender::init(Loader *loader, const Config &rootConfig){
         if (itBT != BindingTable_.end()) {
             if (CSModPtr->stats_[itBT->second.DPID].ports.find(itBT->second.PortNo)
                 != CSModPtr->stats_[itBT->second.DPID].ports.end()) {
-                CSModPtr->stats_[itBT->second.DPID].ports[itBT->second.PortNo].gamma++;
+                if (pkt.test(ofb_eth_type == 0x0800))  {
+                    if (packetIns_.find(str_mac) != packetIns_.end()){
+                        int size = packetIns_[str_mac].size();
+                        if (size) packetIns_[str_mac][size-1] += (packetIns_[str_mac][size-1] != -1) ? 1 : 2;
+                    }
+                    else {
+                        std::vector<int> elem;
+                        int size = (currentTestTime) ? currentTestTime/tau : 1;
+                        for (auto i = 0; i < size; i++) {
+                            elem.push_back(0);
+                        }
+                        elem.push_back(1);
+                        packetIns_.emplace(str_mac,std::move(elem));
+                    }
+                }
                 CSModPtr->stats_[itBT->second.DPID].ports[itBT->second.PortNo].gamma_per_tau++;
                 CSModPtr->stats_[itBT->second.DPID].beta++;
                 CSModPtr->stats_[itBT->second.DPID].lambda++;
                 CSModPtr->sumBeta++;
                 CSModPtr->sumLambda++;
             }
+
             if ((str_ip != "0.0.0.0") && (itBT->second.IP == convert("0.0.0.0").first)) { 
                 CFModPtr->add_filtered_flows(sender_, str_mac, str_ip, itBT->second.DPID, itBT->second.PortNo);
                 if (itBT->second.Status) {
@@ -774,6 +1121,10 @@ void DDoS_Defender::init(Loader *loader, const Config &rootConfig){
                         CFModPtr->switches_[itBT->second.DPID].isEdge = true;
                         //LOG(INFO) << "SWITCH " << itBT->second.DPID << " is EDGE";
                         CSModPtr->numberSW++;
+                        threshold_low = ( CFModPtr->getNumUpSwitches() > 0 ) ? 
+                                        1.0 / (tau*(CFModPtr->getNumUpSwitches()*2)) : 1.0 / tau;
+                        threshold_hight = float(commonPNF) / (tau*(CFModPtr->getNumUpSwitches()+1));
+                        LOG(INFO) << "TL=" << threshold_low << " TH=" << threshold_hight;
 
                         collectStatsModule::statsSW ssw;
                         CSModPtr->stats_.emplace(itBT->second.DPID, ssw);
@@ -788,10 +1139,12 @@ void DDoS_Defender::init(Loader *loader, const Config &rootConfig){
             }
             else {
                 if ((str_ip != "0.0.0.0") && (itBT->second.IP != convert(str_ip).first)) {
-                    LOG(INFO) << "the message came from the host " << str_ip 
-                                << " with different IP that is in the BindingTable " << itBT->second.IP;
+                    //LOG(INFO) << "the message came from the host " << str_ip 
+                    //            << " with different IP that is in the BindingTable " << itBT->second.IP;
                     if (itBT->second.oldIP == convert("0.0.0.0").first) {
-                        CFModPtr->delete_old_flows(sender_, str_mac, itBT->second.getStrIP(), itBT->second.DPID, itBT->second.PortNo);
+                        CFModPtr->delete_old_flows(sender_, str_mac, itBT->second.getStrIP(), 
+                                                    itBT->second.DPID, itBT->second.PortNo);
+                        delete_all_flows(str_mac);
                         CFModPtr->add_filtered_flows(sender_, str_mac, str_ip, itBT->second.DPID, itBT->second.PortNo);
                         if (itBT->second.Status) {
                         //    LOG(INFO) << "HOST " << str_mac << " : " << itBT->second.IP << " STATIC CHANGED IP to " << str_ip;
@@ -809,60 +1162,74 @@ void DDoS_Defender::init(Loader *loader, const Config &rootConfig){
                     }           
                 }
                 else if ((str_ip != "0.0.0.0") && (itBT->second.IP == convert(str_ip).first) && (itBT->second.Status == false)) {
+                    CFModPtr->delete_old_flows(sender_, str_mac, str_ip, itBT->second.DPID, itBT->second.PortNo);
+                    delete_all_flows(str_mac);
+                    CFModPtr->add_filtered_flows(sender_, str_mac, str_ip, dpid, in_port);
                     if (dpid != itBT->second.DPID) {
-                        //LOG(INFO) << "HOST " << str_mac << " : " << str_ip << " MIGRATED from " << itBT->second.DPID 
-                        //            << ":" << itBT->second.PortNo << " to " << dpid << ":" << in_port;
+                        LOG(INFO) << "HOST " << str_mac << " : " << str_ip << " MIGRATED from " << itBT->second.DPID 
+                                    << ":" << itBT->second.PortNo << " to " << dpid << ":" << in_port;
                         itBT->second.DPID = dpid;
                         itBT->second.PortNo = in_port;
                         itBT->second.Status = true;
                     }
                     else if (in_port != itBT->second.PortNo) {
-                        //LOG(INFO) << "HOST " << str_mac << " : " << str_ip << " MIGRATED from " << itBT->second.PortNo 
-                        //            << " to " << in_port;
+                        LOG(INFO) << "HOST " << str_mac << " : " << str_ip << " MIGRATED from " << itBT->second.PortNo 
+                                    << " to " << in_port;
                         itBT->second.PortNo = in_port;
                         itBT->second.Status = true;
                     }
-                }
-            }
-            if (itBT->second.Status == false) {
-                //LOG(INFO) << "HOST " << str_mac << " : " << str_ip << " is ON from " << itBT->second.PortNo 
-                //            << " to " << in_port;
-                itBT->second.Status = true;
-            }
-        }
-        return false;
-    }, -30);
-
-    handler_flow_removed_ = Controller::get(loader)->register_handler(
-    [this](of13::FlowRemoved& pi, OFConnectionPtr ofconn) -> bool
-    {
-
-        of13::Match match = pi.match();
-        uint32_t in_port = 0;
-        if (match.in_port()) in_port = match.in_port()->value();
-        LOG(INFO) << "FLOW_REMOVED from SW=" << ofconn->dpid() << " : port=" << in_port 
-                    << " : cookie=" << pi.cookie();
-        std::string sw_port = boost::lexical_cast<std::string>(ofconn->dpid()) + 
-                                boost::lexical_cast<std::string>(in_port);
-        auto itMAC = CFModPtr->sw_port_to_MAC.find(sw_port);
-        if ((itMAC != CFModPtr->sw_port_to_MAC.end()) && (pi.cookie() == 4)) {
-            auto itBT = BindingTable_.find(itMAC->second);
-            auto itST = CSModPtr->stats_.find(ofconn->dpid());
-            if ((itST != CSModPtr->stats_.end()) && (itBT != BindingTable_.end())) {
-                auto itPort = itST->second.ports.find(in_port);
-                if ((itPort != itST->second.ports.end()) && (itPort->second.type == INF)) {
-                    itPort->second.type = USR;
-                    itPort->second.score = threshold_hight;
-                    auto it = infectedMACs_.find(itMAC->first);
-                    if (it != infectedMACs_.end()) infectedMACs_.erase(it);
-                    LOG(INFO) << "INFECTED HOST " << itBT->second.getStrIP() << " COME USERS : score=" 
-                        << itPort->second.score
-                        << " : type=" << itPort->second.whatType();
+                    auto it = CFModPtr->switches_.find(itBT->second.DPID);
+                    if (it != CFModPtr->switches_.end()) {
+                        auto itPort = it->second.ports.unknown.find(itBT->second.PortNo);
+                        if (itPort != it->second.ports.unknown.end()) {
+                            CFModPtr->switches_[itBT->second.DPID].ports.users.emplace(itBT->second.PortNo,true);
+                            CFModPtr->switches_[itBT->second.DPID].ports.unknown.erase(itBT->second.PortNo);
+                            std::string sw_port = boost::lexical_cast<std::string>(itBT->second.DPID) + 
+                                                    boost::lexical_cast<std::string>(itBT->second.PortNo);
+                            CFModPtr->sw_port_to_MAC.emplace(sw_port,str_mac);
+                            collectStatsModule::statsPort port;
+                            CSModPtr->stats_[itBT->second.DPID].ports.emplace(itBT->second.PortNo, port);
+                            //LOG(INFO) << "ON SWITCH " << itBT->second.DPID << " UNKNOWN PORT " << itBT->second.PortNo << " COME USERS";
+                        }
+                    }
+                    else {
+                        LOG(INFO) << "the message came from a switch " << itBT->second.DPID << " that is not in switches_";
+                    }
                 }
             }
         }
         return false;
     }, -30);
+
+    if (appEnabled) {
+        handler_flow_removed_ = Controller::get(loader)->register_handler(
+        [this](of13::FlowRemoved& pi, OFConnectionPtr ofconn) -> bool
+        {
+            of13::Match match = pi.match();
+            uint32_t in_port = 0;
+            if (match.in_port()) in_port = match.in_port()->value();
+            uint8_t reason = pi.reason();
+            std::string sw_port = boost::lexical_cast<std::string>(ofconn->dpid()) + 
+                                    boost::lexical_cast<std::string>(in_port);
+            auto itMAC = CFModPtr->sw_port_to_MAC.find(sw_port);
+            if ((itMAC != CFModPtr->sw_port_to_MAC.end()) && (pi.cookie() == 4) && (reason == of13::OFPRR_IDLE_TIMEOUT)) {
+                auto itBT = BindingTable_.find(itMAC->second);
+                auto itST = CSModPtr->stats_.find(ofconn->dpid());
+                if ((itST != CSModPtr->stats_.end()) && (itBT != BindingTable_.end())) {
+                    auto itPort = itST->second.ports.find(in_port);
+                    if ((itPort != itST->second.ports.end()) && (itPort->second.type == INF)) {
+                        itPort->second.type = USR;
+                        itPort->second.score = threshold_hight;
+                        auto it = infectedMACs_.find(itMAC->first);
+                        if (it != infectedMACs_.end()) infectedMACs_.erase(it);
+                        delete_drop_flows(itST->first, itPort->first);
+                        LOG(INFO) << "flow_removed => infected host mac=" << itMAC->second << " : ip=" << itBT->second.getStrIP() << " come USERS";
+                    }
+                }
+            }
+            return false;
+        }, -30);
+    }
 
     //FLOW STATS REPLY
     handler_flow_stats_ = Controller::get(loader)->register_handler(
@@ -872,6 +1239,7 @@ void DDoS_Defender::init(Loader *loader, const Config &rootConfig){
         uint64_t sw_id = ofconn->dpid();
         if (BindingTable_.size()) {
             std::unordered_map<std::string, PortStatCount> portStats;
+            std::unordered_map<std::string, int> testStats;
             for (auto flow : pi.flow_stats()){
                 of13::FlowStats *flow1 = static_cast<of13::FlowStats *>(&flow);
                 of13::Match match = flow1->match();
@@ -879,17 +1247,25 @@ void DDoS_Defender::init(Loader *loader, const Config &rootConfig){
                 std::string eth_src = "";
                 if (match.in_port()) in_port = match.in_port()->value();
                 if (match.eth_src()) eth_src += match.eth_src()->value().to_string();
-                //LOG(INFO) << "SW(" << sw_id << ") :: in_port=" << in_port 
-                //                    << " : eth_src=" << eth_src
-                //                    << " : flow_prior=" << flow1->priority()
-                //                    << " : cookie=" << flow1->cookie();
                 
                 auto itBT = BindingTable_.find(eth_src);
                 if (itBT != BindingTable_.end()) {
                     auto it = portStats.find(eth_src);
+                    //for testing
+                    //-----------------------------------
+                    if (computeTableUsage) {
+                        auto testIT = testStats.find(eth_src);
+                        if (testIT != testStats.end()) testIT->second++;
+                        else testStats.emplace(eth_src,1);
+                    }
+                    //-----------------------------------
+
                     if (it != portStats.end()){
-                        if (flow1->cookie() == 0x2) {
-                            it->second.drop+=flow.packet_count();
+                        if ((flow1->cookie() == 0x2) || (flow1->cookie() == 0x4)){
+                            if (flow1->cookie() == 0x2)
+                                it->second.drop+=flow.packet_count();
+                            else 
+                                it->second.drop_0x4+=flow.packet_count();
                         }
                         else if (flow1->cookie() != 0x3) {
                             it->second.packets+=flow.packet_count();
@@ -898,8 +1274,11 @@ void DDoS_Defender::init(Loader *loader, const Config &rootConfig){
                         }
                     }
                     else {
-                        if (flow1->cookie() == 0x2) {
-                            portStats.emplace(eth_src,PortStatCount(sw_id,in_port,flow.packet_count()));
+                        if ((flow1->cookie() == 0x2) || (flow1->cookie() == 0x4)) {
+                            if (flow1->cookie() == 0x2)
+                                portStats.emplace(eth_src,PortStatCount(sw_id,in_port,flow.packet_count()));
+                            else
+                                portStats.emplace(eth_src,PortStatCount(sw_id,in_port,0,0,1,false,flow.packet_count()));
                         }
                         else if (flow.cookie() != 0x3) {
                             bool from_LS = (flow1->cookie() == 0x0) ? true : false;
@@ -907,17 +1286,39 @@ void DDoS_Defender::init(Loader *loader, const Config &rootConfig){
                         }
                     }
                 }
-                else if (flow1->cookie() == 0x4) {
-                    std::string sw_port = boost::lexical_cast<std::string>(sw_id) + 
-                                            boost::lexical_cast<std::string>(in_port);
-                    auto itMAC = CFModPtr->sw_port_to_MAC.find(sw_port);
-                    if (itMAC != (CFModPtr->sw_port_to_MAC).end()) {
-                        auto it = portStats.find(itMAC->second);
-                        if (it != portStats.end()) {
-                            it->second.drop+=flow.packet_count();
+                else {
+                    //for testing
+                    //-----------------------------------
+                    if (computeTableUsage) {
+                        std::string sw_port = boost::lexical_cast<std::string>(sw_id) + 
+                                                    boost::lexical_cast<std::string>(in_port);
+                        auto itMAC = CFModPtr->sw_port_to_MAC.find(sw_port);
+                        if (itMAC != CFModPtr->sw_port_to_MAC.end()) {
+                            auto testIT = testStats.find(itMAC->second);
+                            if (testIT != testStats.end()) testIT->second++;
+                            else testStats.emplace(eth_src,1);
                         }
-                        else {
-                            portStats.emplace(itMAC->second,PortStatCount(sw_id,in_port,flow.packet_count()));
+                    }
+                    //-----------------------------------
+
+                    if ((flow1->cookie() == 0x4) || (flow1->cookie() == 0x2)) {
+                        std::string sw_port = boost::lexical_cast<std::string>(sw_id) + 
+                                                boost::lexical_cast<std::string>(in_port);
+                        auto itMAC = CFModPtr->sw_port_to_MAC.find(sw_port);
+                        if (itMAC != (CFModPtr->sw_port_to_MAC).end()) {
+                            auto it = portStats.find(itMAC->second);
+                            if (it != portStats.end()) {
+                                if (flow1->cookie() == 0x2)
+                                    it->second.drop+=flow.packet_count();
+                                else
+                                    it->second.drop_0x4+=flow.packet_count();
+                            }
+                            else {
+                                if (flow1->cookie() == 0x2)
+                                    portStats.emplace(itMAC->second,PortStatCount(sw_id,in_port,flow.packet_count()));
+                                else
+                                    portStats.emplace(itMAC->second,PortStatCount(sw_id,in_port,0,0,1,false,flow.packet_count()));
+                            }
                         }
                     }
                 }
@@ -927,33 +1328,51 @@ void DDoS_Defender::init(Loader *loader, const Config &rootConfig){
                 for (auto itPort=itSW->second.ports.begin(); itPort != itSW->second.ports.end(); itPort++){
                     if (itPort->second.diff_drop || itPort->second.drop) {
                         itPort->second.diff_drop = 0;
-                        itPort->second.drop = 0;
                     }
                     itPort->second.PNF = commonPNF;
                 }
             }
-            
             int diff = 0;
+            int diff_0x4 = 0;
             bool clear_table = true;
+            
+            //for testing
+            //-----------------------------------
+            if (computeTableUsage) {
+                LOG(INFO) << "testStats from switch=" << sw_id << " ::";
+                checkTableUsage(testStats);
+            }
+            //-----------------------------------
+
             for (auto it : portStats) {
                 if ((infectedMACs_.find(it.first)!=infectedMACs_.end()) && it.second.from_LS) clear_table = false;
                 auto elemBT = BindingTable_.find(it.first);
                 if ((elemBT != BindingTable_.end()) && (sw_id == elemBT->second.DPID))  {
                     auto elemST = CSModPtr->stats_[sw_id].ports.find(elemBT->second.PortNo);
 
-                    //LOG(INFO) << "port(portStats)=" << elemBT->second.PortNo << " :: drop=" << it.second.drop
+                    //LOG(INFO) << "SW=" << sw_id << " port(portStats)=" << elemBT->second.PortNo << " :: drop=" << it.second.drop
+                    //            << " :: drop0x4=" << it.second.drop_0x4
                     //            << " : packets=" << it.second.packets << " : flows=" << it.second.flows;
                     if (elemST != CSModPtr->stats_[sw_id].ports.end()) {
-                        //LOG(INFO) << "port(stats_)=" << elemST->first << " :: drop=" << elemST->second.drop
+                        elemST->second.isCheck = true;
+                        //LOG(INFO) << "SW=" << sw_id << " port(stats_)=" << elemST->first << " :: drop=" << elemST->second.drop
+                        //            << " :: drop0x4=" << elemST->second.drop_0x4
                         //            << " : diff_drop=" << elemST->second.diff_drop;
-
-                        if (it.second.drop > elemST->second.drop) 
+                        
+                        if (it.second.drop >= elemST->second.drop) 
                             diff = it.second.drop - elemST->second.drop;
                         else diff = 0;
+
+                        if (it.second.drop_0x4 >= elemST->second.drop_0x4) 
+                            diff_0x4 = it.second.drop_0x4 - elemST->second.drop_0x4;
+                        else {
+                            diff_0x4 = (it.second.drop_0x4 > 0) ? (elemST->second.drop_0x4 / it.second.drop_0x4)*2 : 0;
+                        }
 
                         if ((diff < 2*common_t) && (diff) && (elemST->second.type != INF)) {
                             CFModPtr->delete_old_flows(sender_, it.first, elemBT->second.getStrIP(), 
                                                                         sw_id,  elemBT->second.PortNo);
+                            delete_all_flows(it.first);
                             elemBT->second.oldIP = elemBT->second.IP;
                             elemBT->second.IP = convert("0.0.0.0").first;
                             LOG(INFO) << "response from SW=" << sw_id << ": HAVE SOME DROPPED PACKETS per interval(" << diff
@@ -962,58 +1381,60 @@ void DDoS_Defender::init(Loader *loader, const Config &rootConfig){
                         else if (diff && (elemST->second.type != INF)) {
                             LOG(INFO) << "response from SW=" << sw_id << ": TOO MANY DROPPED PACKETS per interval(" << diff 
                                         << ") FROM " << it.first << " : " << elemBT->second.getStrIP();
+                            
                         }
                     
                         elemST->second.diff_drop = diff;
                         elemST->second.drop = it.second.drop;
-                        elemST->second.PNF = (it.second.flows) ? float(it.second.packets) / it.second.flows : commonPNF;
+                        elemST->second.diff_drop_0x4 = diff_0x4;
+                        elemST->second.drop_0x4 = it.second.drop_0x4;
+                        elemST->second.PNF = ((it.second.flows > 0) && (it.second.packets > 0)) ? 
+                                                float(it.second.packets) / it.second.flows : commonPNF;
+
+                        if (packetDrops_.find(it.first) != packetDrops_.end()){
+                            int size = packetDrops_[it.first].size();
+                            if (size) packetDrops_[it.first][size-1] = diff + diff_0x4;
+                        }
+                        else {
+                            std::vector<int> elem;
+                            int size = (currentTestTime)  ? currentTestTime/tau : 1;
+                            for (auto i = 0; i < size; i++) {
+                                elem.push_back(0);
+                            }
+                            elem.push_back(diff+diff_0x4);
+                            packetDrops_.emplace(it.first,std::move(elem));
+                        }
                     }
                 
                 }
             }  
-            if (clear_table && !CLEAR) numberClearTables++;  
-            if ((numberClearTables == CSModPtr->stats_.size()) && !CLEAR) {
+
+            for (auto itPort = CSModPtr->stats_[sw_id].ports.begin(); 
+                        itPort != CSModPtr->stats_[sw_id].ports.end(); itPort++) {
+                if (!itPort->second.isCheck) {
+                    itPort->second.diff_drop = 0;
+                    itPort->second.diff_drop_0x4 = 0;
+                }
+                itPort->second.isCheck=false;
+            }
+
+            if (clear_table && !CLEAR) numberClearSW++;  
+            if ((numberClearSW == CSModPtr->stats_.size()) && !CLEAR) {
                 CLEAR = true;
                 LOG(INFO) << "!!!!!!!!!!!!!!!!!!END CLEAR TABLES!!!!!!!!!!!!!!!!!!!";
             }
         }
-        //FOR TESTING
-        
-        /*if (!test_interval) {
-            LOG(INFO) << "STATS FROM SWITCH ID " << sw_id;
-            add_flow_statistic_from_switch(flow_stats, sw_id);
-            bool done = true;
-            for (auto it : switch_flow_test){
-                if (!it.second.done) {
-                    done = false;
-                    break;
-                }
-            }
-            if (done) {
-                test_interval = true;
-            }
-        }
-        else {
-            test_interval = false;
-        }*/
-        
-        //add_src_statistic_from_switch(flow_stats, sw_id);
-        /*
-        bool is_filled = true;
-        sw_response[sw_id] = true;
-        for (auto it : sw_response)
-            if (it.second == false) {
-                is_filled = false;
-            }
-
-        if (ATTACK) {
-            check_src_criterion(sw_id);
-            if (is_filled == true) {
-                check_attack_end();
-            }
-        }*/
         return false;
     }, -30);
+
+    //for testing without DDDF
+    //-----------------------------------
+    if (!appEnabled) {
+        infectedIPs_.insert("10.0.0.1");
+        infectedIPs_.insert("10.0.0.5");
+        infectedIPs_.insert("10.255.255.254");
+    }
+    //-----------------------------------
 
     LOG(INFO) << "----------------------------------";
     LOG(INFO) << "DDoS_Defender init finish its work";
@@ -1029,32 +1450,145 @@ void DDoS_Defender::startUp(Loader* ) {
 
 void DDoS_Defender::timerEvent(QTimerEvent*) {
     current_time+=tau;
-    get_cpu_util();
-    bool isCommonInterval = (current_time % (common_t)) ? false : true;
-    if(isCommonInterval && !ATTACK) {
+    if (logEnabled) {
         LOG(INFO) << "**********************************************";
         LOG(INFO) << "CURRENT TIME " << current_time;
-        CFModPtr->printSwitches();
-        LOG(INFO) << "----------------------------------------";
+    }
+
+    get_cpu_util();
+
+    bool isCommonInterval = (current_time % (common_t)) ? false : true;
+    if (computeFP_FN && startLogInfoForFPFN) {
+        currentTestTime+=tau;
+        LOG(INFO) << "LOG FOR FP FN time=" << currentTestTime;
+        if (isCommonInterval) {
+            for (auto& itMAC : packetIns_) itMAC.second.push_back(0);
+            for (auto& itMAC : packetDrops_) itMAC.second.push_back(0);
+        }
+        else {
+            for (auto& itMAC : packetIns_) itMAC.second.push_back(-1);
+            for (auto& itMAC : packetDrops_) itMAC.second.push_back(-1);
+        }
+    }
+    
+
+    if (appEnabled) {
+        if (sw_response_number >= CSModPtr->numberSW) {
+            if (!ATTACK) {
+                CSModPtr->comparison(); 
+                if (!ATTACK) {
+                    if (logEnabled) {
+                        LOG(INFO) << "----------------------------------------";
+                        CSModPtr->printStats();
+                        LOG(INFO) << "----------------------------------------";
+                    }
+                    trackINFHosts(); 
+                }
+            }
+            else {
+                if (logEnabled) {
+                    LOG(INFO) << "----------------------------------------";
+                    CSModPtr->printStats();
+                    LOG(INFO) << "----------------------------------------";
+                }
+            }
+            
+            sw_response_number = 0;
+        }
+    }
+
+    if(isCommonInterval && !ATTACK) {
         CFModPtr->getFlowStats(sender_);
-        CSModPtr->comparison();
-        trackINFHosts();
-        printBindingTable();
-        LOG(INFO) << "**********************************************";
+        CFModPtr->save_switches_to_database(db_connector_);
+        CSModPtr->save_stats_to_database(db_connector_);
+        save_BT_to_database();
+
+        //for testing
+        //-----------------------------------
+        if (!appEnabled)
+            if ((infectedIPs_.size() > infectedMACs_.size()) && (currentTestTime > 21)) 
+                fillInfectedMACs();
+        //-----------------------------------
     }
     if (ATTACK) {
-        CFModPtr->getFlowStats(sender_);
-        checkScore();
+        if (appEnabled)
+            checkScore();
+            
+        if (ATTACK)
+            CFModPtr->getFlowStats(sender_);
+        else {
+            if (isCommonInterval) {
+                CFModPtr->getFlowStats(sender_);
+            }
+        }
+        
     }
 
-    if (sw_response_number >= CSModPtr->numberSW) {
-        LOG(INFO) << "----------------------------------------";
-        CSModPtr->printStats();
-        LOG(INFO) << "----------------------------------------";
-        sw_response_number = 0;
+    if (computeFP_FN && (currentTestTime > testDuration) && !isPacketsAmountSaved) {
+        savedInfoForComputeFPFN();
+        isPacketsAmountSaved = true;
     }
+
+    if (logEnabled)
+        if (isCommonInterval) {
+            CFModPtr->printSwitches();
+            LOG(INFO) << "----------------------------------------";
+            printBindingTable();
+            LOG(INFO) << "**********************************************";
+        }
 
     CSModPtr->clean();
+}
+
+void DDoS_Defender::savedInfoForComputeFPFN() {
+    std::ofstream fout;
+    fout.open("src/apps/ddos-defender/tests/infoForFPandFN.txt", std::ios_base::out | std::ios_base::trunc );
+    if (!fout.is_open())
+        LOG(INFO) << "Can't create file infoForFPandFN.txt!";
+    LOG(INFO) << "INFO for compute FP and FN";
+    fout << "{";
+    uint nMAC = 0, sizeMACs = packetIns_.size();
+    for (auto itMAC : packetIns_) {
+        auto itBT = BindingTable_.find(itMAC.first);
+        if (itBT != BindingTable_.end()) {
+            fout << "'" << itBT->second.getStrIP() << "' : [";
+            for (uint i = 0; i < itMAC.second.size(); i++) {
+                LOG(INFO) << "mac=" << itMAC.first << " packetIn[" << i << "]=" << itMAC.second[i];
+                fout << itMAC.second[i];
+                if ((i+1) < itMAC.second.size()) fout << ",";
+                else fout << "]";
+            }
+            if ((nMAC+1) < sizeMACs) fout << ",";
+        }
+        nMAC++;
+    }
+    fout << "}\n";
+    nMAC = 0, sizeMACs = packetDrops_.size();
+    fout << "{";
+    for (auto itMAC : packetDrops_) {
+        auto itBT = BindingTable_.find(itMAC.first);
+        if (itBT != BindingTable_.end()) {
+            fout << "'" << itBT->second.getStrIP() << "' : [";
+            for (uint i = 0; i < itMAC.second.size(); i++) {
+                LOG(INFO) << "mac=" << itMAC.first << " packetDrop[" << i << "]=" << itMAC.second[i];
+                fout << itMAC.second[i];
+                if ((i+1) < itMAC.second.size()) fout << ",";
+                else fout << "]";
+            }
+            if ((nMAC+1) < sizeMACs) fout << ",";
+        }
+        nMAC++;
+    }
+    fout << "}\n";
+    fout.close();
+}
+
+void DDoS_Defender::fillInfectedMACs() {
+    for (auto itBT : BindingTable_) {
+        if (infectedIPs_.find(itBT.second.getStrIP()) != infectedIPs_.end()) {
+            infectedMACs_.insert(itBT.first);
+        }
+    }
 }
 
 void DDoS_Defender::checkScore(){
@@ -1062,34 +1596,47 @@ void DDoS_Defender::checkScore(){
     bool is_attack_end = true;
     for (auto itSW = CSModPtr->stats_.begin(); itSW != CSModPtr->stats_.end(); itSW++) {
         for (auto itPort = itSW->second.ports.begin(); itPort != itSW->second.ports.end(); itPort++) {
-            LOG(INFO) << "PORT(" << itPort->first << ") :: gamma_per_tau="
-                        << itPort->second.gamma_per_tau << " : PNF="
-                        << itPort->second.PNF << " : last_score=" 
-                        << itPort->second.score;
+            if ((itPort->second.type == AMB) && (itPort->second.PNF > 10)) 
+                itPort->second.PNF = commonPNF;
             score = (itPort->second.gamma_per_tau) ? 
                         itPort->second.PNF / itPort->second.gamma_per_tau :
                         itPort->second.PNF;
-            itPort->second.score = score;
+            score = score*(1-alpha) + itPort->second.score*alpha;
             if (itPort->second.type != INF) {
+                itPort->second.score = score;
                 if (score <= threshold_low) {
-                    score = score*(1-alpha) + itPort->second.score*alpha;
-                    itPort->second.type = INF;
+                    itPort->second.type = INF; 
                     send_drop_flows(itSW->first,itPort->first);
                     std::string sw_port = boost::lexical_cast<std::string>(itSW->first) + 
                                             boost::lexical_cast<std::string>(itPort->first);
                     auto itMAC = CFModPtr->sw_port_to_MAC.find(sw_port);
                     if (itMAC != CFModPtr->sw_port_to_MAC.end()) {
                         infectedMACs_.insert(itMAC->second);
+                        auto itBT = BindingTable_.find(itMAC->second);
+                        if (itBT != BindingTable_.end()) {
+                            LOG(INFO) << "host mac=" << itMAC->second << " : ip=" 
+                                        << itBT->second.getStrIP() 
+                                        << " : sw=" << itSW->first << " : port=" << itPort->first
+                                        << " come INFECTED with score=" << itPort->second.score;
+                        }
                     }
+                    itSW->second.betaInf += itPort->second.gamma_per_tau;
+                    itPort->second.drop_0x4 = itPort->second.gamma_per_tau;
                 }
                 else {
-                    if (score >= threshold_hight) {
-                        score = score*(1-alpha) + itPort->second.score*alpha;
+                    if ((score >= threshold_hight) && (itPort->second.type != USR)) {
                         itPort->second.type = USR;
+                        std::string sw_port = boost::lexical_cast<std::string>(itSW->first) + 
+                                                boost::lexical_cast<std::string>(itPort->first);
+                        auto itMAC = CFModPtr->sw_port_to_MAC.find(sw_port);
+                        auto itBT = BindingTable_.find(itMAC->second);
+                        LOG(INFO) << "host mac=" << itMAC->second << " : ip=" 
+                                        << itBT->second.getStrIP() 
+                                        << " : sw=" << itSW->first << " : port=" << itPort->first
+                                        << " come USERS with score=" << itPort->second.score;
                     }
                     else { 
-                        if (cpu_util > threshold_cpu_util) {
-                            score = score*(1-alpha) + itPort->second.score*alpha;
+                        if ((score < threshold_hight) && (cpu_util > threshold_cpu_util)) {
                             itPort->second.type = INF;
                             send_drop_flows(itSW->first,itPort->first);
                             std::string sw_port = boost::lexical_cast<std::string>(itSW->first) + 
@@ -1097,31 +1644,63 @@ void DDoS_Defender::checkScore(){
                             auto itMAC = CFModPtr->sw_port_to_MAC.find(sw_port);
                             if (itMAC != CFModPtr->sw_port_to_MAC.end()) {
                                 infectedMACs_.insert(itMAC->second);
+                                auto itBT = BindingTable_.find(itMAC->second);
+                                if (itBT != BindingTable_.end()) {
+                                    LOG(INFO) << "host mac=" << itMAC->second << " : ip=" 
+                                                << itBT->second.getStrIP() 
+                                        << " : sw=" << itSW->first << " : port=" << itPort->first
+                                                << " come INFECTED with score=" << itPort->second.score;
+                                }
                             }
+                            itSW->second.betaInf += itPort->second.gamma_per_tau;
+                            itPort->second.drop_0x4 = itPort->second.gamma_per_tau;
                         }
-                        else {
-                            score = score*(1-alpha) + itPort->second.score*alpha;
+                        else if ((itPort->second.type != AMB) && (score < threshold_hight)) {
                             itPort->second.type = AMB;
-                            is_attack_end = false;
+                            std::string sw_port = boost::lexical_cast<std::string>(itSW->first) + 
+                                                    boost::lexical_cast<std::string>(itPort->first);
+                            auto itMAC = CFModPtr->sw_port_to_MAC.find(sw_port);
+                            if (itMAC != CFModPtr->sw_port_to_MAC.end()) {
+                                auto itBT = BindingTable_.find(itMAC->second);
+                                if (itBT != BindingTable_.end()) {
+                                    LOG(INFO) << "host mac=" << itMAC->second << " : ip=" 
+                                                << itBT->second.getStrIP()
+                                        << " : sw=" << itSW->first << " : port=" << itPort->first
+                                                << " come AMBIGUOUS with score=" << itPort->second.score;
+                                }
+                            }
                         }
                     }
                 }
             }
+            if (itPort->second.type == AMB) is_attack_end = false;
         }
     }
     if (is_attack_end && (CSModPtr->sumBeta <= omega)) {
         ATTACK = !is_attack_end;
         LOG(INFO) << "!!!!!!!!!!!!!!!!!!!!!ATTACK END!!!!!!!!!!!!!!!!!!!!!!!!!!";
-        numberClearTables = 0;
+        CSModPtr->sumBeta = 0;
+        CSModPtr->sumLambda = 0;
+        for (auto itSW=CSModPtr->stats_.begin(); itSW!=CSModPtr->stats_.end(); itSW++){
+            itSW->second.beta = 0;
+            itSW->second.lambda = 0;
+        }
+        numberClearSW = 0;
         CLEAR = false;
-        clearTables();
+        cleanTables();
     }
 }
 
-void DDoS_Defender::clearTables() {
+void DDoS_Defender::cleanTables() {
     for (auto infMAC : infectedMACs_) {
-        for (auto itSW : CSModPtr->stats_) {
-            LOG(INFO) << "send delete flows to SW=" << itSW.first << " for MAC=" << infMAC;
+        delete_all_flows(infMAC);
+    }
+}
+
+void DDoS_Defender::delete_all_flows(std::string MAC) {
+    for (auto itSW : CSModPtr->stats_) {
+        //LOG(INFO) << "send delete flows to SW=" << itSW.first << " for MAC=" << infMAC;
+        {
             of13::FlowMod fm1, fm2;
             std::stringstream ss;
             fm1.command(of13::OFPFC_DELETE); fm2.command(of13::OFPFC_DELETE);
@@ -1132,7 +1711,7 @@ void DDoS_Defender::clearTables() {
             fm1.idle_timeout(uint64_t(60)); fm2.idle_timeout(uint64_t(60)); 
             fm1.hard_timeout(uint64_t(1800)); fm2.hard_timeout(uint64_t(1800)); 
 
-            ethaddr eth_src(infMAC);
+            ethaddr eth_src(MAC);
             ss.str(std::string());
             ss.clear();
             ss << eth_src;
@@ -1145,26 +1724,58 @@ void DDoS_Defender::clearTables() {
             sender_->send(itSW.first, fm1);
             sender_->send(itSW.first, fm2);
         }
+        {
+            of13::FlowMod fm1, fm2;
+            std::stringstream ss;
+            fm1.command(of13::OFPFC_DELETE); fm2.command(of13::OFPFC_DELETE);
+            fm1.table_id(of13::OFPTT_ALL); fm2.table_id(of13::OFPTT_ALL);
+            fm1.priority(2); fm2.priority(2);
+            fm1.cookie(0x0); fm2.cookie(0x0);
+            fm1.cookie_mask(0); fm2.cookie_mask(0);
+            fm1.idle_timeout(uint64_t(60)); fm2.idle_timeout(uint64_t(60)); 
+            fm1.hard_timeout(uint64_t(1800)); fm2.hard_timeout(uint64_t(1800)); 
+
+            ethaddr eth_src(MAC);
+            ss.str(std::string());
+            ss.clear();
+            ss << eth_src;
+            fm1.add_oxm_field(new of13::EthDst{fluid_msg::EthAddress(ss.str())});
+            fm2.add_oxm_field(new of13::EthDst{fluid_msg::EthAddress (ss.str())});
+
+            fm1.out_port(of13::OFPP_ANY); fm2.out_port(of13::OFPP_ANY);
+            fm1.out_group(of13::OFPP_ANY); fm2.out_group(of13::OFPP_ANY);
+
+            sender_->send(itSW.first, fm1);
+            sender_->send(itSW.first, fm2);
+        }
     }
+    
 }
 
 void DDoS_Defender::trackINFHosts(){
     if (CSModPtr->stats_.size()) {
         for (auto itSW=CSModPtr->stats_.begin(); itSW!=CSModPtr->stats_.end(); itSW++){
-            if (itSW->second.beta < itSW->second.alpha) {
+            if (itSW->second.betaInf < itSW->second.alpha) {
                 for (auto itPort = itSW->second.ports.begin(); itPort!=itSW->second.ports.end(); itPort++) {
-                    if (itPort->second.type == INF) {
-                        std::string sw_port = boost::lexical_cast<std::string>(itSW->first) + 
-                                                boost::lexical_cast<std::string>(itPort->first);
-                        auto itMAC = CFModPtr->sw_port_to_MAC.find(sw_port);
-                        auto itBT = BindingTable_.find(itMAC->second);
-                        itPort->second.type = USR;
-                        itPort->second.score = threshold_hight;
-                        auto it = infectedMACs_.find(itMAC->first);
-                        if (it != infectedMACs_.end()) infectedMACs_.erase(it);
-                        LOG(INFO) << "INFECTED HOST " << itBT->second.getStrIP() << " COME USERS : score=" 
-                            << itPort->second.score
-                            << " : type=" << itPort->second.whatType();
+                    auto sw = CFModPtr->switches_.find(itSW->first);
+                    if (sw != CFModPtr->switches_.end()) {
+                        auto port = sw->second.ports.users.find(itPort->first);
+                        if (port != sw->second.ports.users.end()) {
+                            if ((itPort->second.type == INF) && (port->second)) {
+                                std::string sw_port = boost::lexical_cast<std::string>(itSW->first) + 
+                                                        boost::lexical_cast<std::string>(itPort->first);
+                                auto itMAC = CFModPtr->sw_port_to_MAC.find(sw_port);
+                                auto itBT = BindingTable_.find(itMAC->second);
+                                itPort->second.type = USR;
+                                itPort->second.score = threshold_hight;
+                                auto it = infectedMACs_.find(itMAC->first);
+                                if (it != infectedMACs_.end()) infectedMACs_.erase(it);
+                                delete_drop_flows(itSW->first,itPort->first);
+                                LOG(INFO) << "trackINFHosts => infected host mac=" << itMAC->second << " : ip=" << itBT->second.getStrIP() << " come USERS"; 
+                                            //<< itPort->second.score
+                                            //<< " : type=" << itPort->second.whatType();
+                    }
+                        }
                     }
                 }
             }
@@ -1177,11 +1788,7 @@ void collectStatsModule::comparison(){
         bool isRecountAlpha = false;
         for (auto itSW=stats_.begin(); itSW!=stats_.end(); itSW++){
             for (auto itPort : itSW->second.ports) {
-                if (itPort.second.whatType() == "INF") {
-                    itSW->second.beta += itPort.second.diff_drop;
-                    itSW->second.lambda += itPort.second.diff_drop;
-                    sumLambda += itPort.second.diff_drop;
-                }
+                itSW->second.betaInf += itPort.second.diff_drop_0x4;
             }
             if ((itSW->second.beta > itSW->second.alpha) && (sumBeta > omega)) {
                 ATTACK = true;
@@ -1224,14 +1831,15 @@ void collectStatsModule::clean(){
         bool isBigInterval = (current_time % (big_t)) ? false : true;
         bool isCommonInterval = (current_time % (common_t)) ? false : true;
         if (isBigInterval) sumLambda = 0;
-        if (isCommonInterval) {
-            sumBeta = 0;
-            for (auto itSW=stats_.begin(); itSW!=stats_.end(); itSW++){
+        if (isCommonInterval) sumBeta = 0;
+        for (auto itSW=stats_.begin(); itSW!=stats_.end(); itSW++){
+            if (isBigInterval) {
+                
                 itSW->second.beta = 0;
-                if (isBigInterval) itSW->second.lambda = 0;
-                for (auto itPort=itSW->second.ports.begin(); itPort!=itSW->second.ports.end(); itPort++) {
-                    itPort->second.gamma = 0;
-                }
+                itSW->second.betaInf = 0;
+            }
+            if (isBigInterval) {
+                itSW->second.lambda = 0;
             }
         }
     }
@@ -1356,9 +1964,30 @@ void controlFilterModule::delete_old_flows(OFMsgSender* sender,
 }
 
 void DDoS_Defender::send_drop_flows(uint64_t sw_id, uint32_t port) {
-    LOG(INFO) << "SEND DROP FLOWS to SW=" << sw_id << " : port=" << port;
+    //LOG(INFO) << "SEND DROP FLOWS to SW=" << sw_id << " : port=" << port;
     of13::FlowMod fm1, fm2;
     fm1.command(of13::OFPFC_ADD); fm2.command(of13::OFPFC_ADD);
+    fm1.xid(0); fm2.xid(0);
+    fm1.buffer_id(OFP_NO_BUFFER); fm2.buffer_id(OFP_NO_BUFFER);
+    fm1.table_id(0); fm2.table_id(0);
+    fm1.priority(4); fm2.priority(4);
+    fm1.cookie(0x4); fm2.cookie(0x4);
+    fm1.idle_timeout(60); fm2.idle_timeout(60);
+    fm1.hard_timeout(0); fm2.hard_timeout(0);
+    fm1.flags( of13::OFPFF_SEND_FLOW_REM );
+    fm2.flags( of13::OFPFF_SEND_FLOW_REM );
+    fm1.add_oxm_field(new of13::EthType(0x0800));
+    fm2.add_oxm_field(new of13::EthType(0x0806));
+    fm1.add_oxm_field(new of13::InPort(port));
+    fm2.add_oxm_field(new of13::InPort(port));
+    sender_->send(sw_id, fm1);
+    sender_->send(sw_id, fm2);
+}
+
+void DDoS_Defender::delete_drop_flows(uint64_t sw_id, uint32_t port) {
+    //LOG(INFO) << "DELETE DROP FLOWS to SW=" << sw_id << " : port=" << port;
+    of13::FlowMod fm1, fm2;
+    fm1.command(of13::OFPFC_DELETE); fm2.command(of13::OFPFC_DELETE);
     fm1.xid(0); fm2.xid(0);
     fm1.buffer_id(OFP_NO_BUFFER); fm2.buffer_id(OFP_NO_BUFFER);
     fm1.table_id(0); fm2.table_id(0);
@@ -1388,19 +2017,22 @@ void controlFilterModule::getFlowStats(OFMsgSender* sender){
             mprf.flags(0);
             sender->send(it.first, mprf);
         }
-    }
-    /*bool is_filled = true;
-    for (auto it : sw_response) {
-        if (it.second == false) {
-            is_filled = false;
-            break;
+        else {
+            //for testing
+            //-----------------------------------
+            /*
+            of13::MultipartRequestFlow mprf;
+            mprf.table_id(of13::OFPTT_ALL);
+            mprf.out_port(of13::OFPP_ANY);
+            mprf.out_group(of13::OFPG_ANY);
+            mprf.cookie(0x0);
+            mprf.cookie_mask(0x0);
+            mprf.flags(0);
+            sender->send(it.first, mprf);
+            */
+            //-----------------------------------
         }
     }
-    if (is_filled == true){
-        for (auto it = sw_response.begin(); it != sw_response.end(); it++) {
-            it->second = false;
-        }
-    }*/
 }
 
 void DDoS_Defender::printBindingTable(){
@@ -1444,17 +2076,33 @@ void collectStatsModule::printStats(){
     for (auto itSW : stats_) {
         LOG(INFO) << "SW=" << itSW.first << " :: ports : ";
         for (auto itPort : itSW.second.ports) {
-            LOG(INFO) << itPort.first << " :: gamma=" << itPort.second.gamma 
-                        << " : gamma_per_tau=" << itPort.second.gamma_per_tau
+            LOG(INFO) << itPort.first << " : gamma_per_tau=" << itPort.second.gamma_per_tau
                         << " : drop=" << itPort.second.drop
                         << " : diff_drop=" << itPort.second.diff_drop 
+                        << " : drop_0x4=" << itPort.second.drop_0x4
+                        << " : diff_drop_0x4=" << itPort.second.diff_drop_0x4 
                         << " : PNF=" << itPort.second.PNF
                         << " : score=" << itPort.second.score 
                         << " : type=" << itPort.second.whatType();
         }
-        LOG(INFO) << "beta=" << itSW.second.beta << " : lambda=" << itSW.second.lambda << " : alpha=" << itSW.second.alpha;
+        LOG(INFO) << "beta=" << itSW.second.beta << " : betaInf=" << itSW.second.betaInf << 
+                    " : lambda=" << itSW.second.lambda << 
+                     " : alpha=" << itSW.second.alpha;
     }
     LOG(INFO) << "numberSW=" << numberSW << " : sumBeta=" << sumBeta << " : sumLambda=" << sumLambda;
 }
 
+void DDoS_Defender::printInfectedMACs() {
+    LOG(INFO) << "infected MACs (size = " << infectedMACs_.size() << ") :";
+    for (auto it : infectedMACs_) {
+        LOG(INFO) << "    " << it;
+    }
+}
+
+void DDoS_Defender::printSwPortToMAC() {
+    LOG(INFO) << "SW ports to MACs (size = " << CFModPtr->sw_port_to_MAC.size() << ") :";
+    for (auto it : CFModPtr->sw_port_to_MAC) {
+        LOG(INFO) << "    " << it.first << " : " << it.second;
+    }
+}
 }

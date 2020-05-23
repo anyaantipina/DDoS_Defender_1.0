@@ -1,0 +1,41 @@
+PING 10.0.0.4 (10.0.0.4) 56(84) bytes of data.
+64 bytes from 10.0.0.4: icmp_seq=4 ttl=64 time=2386 ms
+64 bytes from 10.0.0.4: icmp_seq=5 ttl=64 time=1597 ms
+64 bytes from 10.0.0.4: icmp_seq=7 ttl=64 time=0.951 ms
+64 bytes from 10.0.0.4: icmp_seq=8 ttl=64 time=12.2 ms
+64 bytes from 10.0.0.4: icmp_seq=1 ttl=64 time=7163 ms
+64 bytes from 10.0.0.4: icmp_seq=2 ttl=64 time=6135 ms
+64 bytes from 10.0.0.4: icmp_seq=3 ttl=64 time=5609 ms
+64 bytes from 10.0.0.4: icmp_seq=6 ttl=64 time=2748 ms
+
+--- 10.0.0.4 ping statistics ---
+8 packets transmitted, 8 received, 0% packet loss, time 7125ms
+rtt min/avg/max/mdev = 0.951/3206.644/7163.164/2596.975 ms, pipe 8
+PING 10.0.0.6 (10.0.0.6) 56(84) bytes of data.
+64 bytes from 10.0.0.6: icmp_seq=1 ttl=64 time=709 ms
+64 bytes from 10.0.0.6: icmp_seq=2 ttl=64 time=0.041 ms
+64 bytes from 10.0.0.6: icmp_seq=3 ttl=64 time=2.89 ms
+64 bytes from 10.0.0.6: icmp_seq=4 ttl=64 time=0.057 ms
+64 bytes from 10.0.0.6: icmp_seq=5 ttl=64 time=0.061 ms
+64 bytes from 10.0.0.6: icmp_seq=6 ttl=64 time=5.51 ms
+64 bytes from 10.0.0.6: icmp_seq=7 ttl=64 time=0.063 ms
+64 bytes from 10.0.0.6: icmp_seq=8 ttl=64 time=0.828 ms
+
+--- 10.0.0.6 ping statistics ---
+8 packets transmitted, 8 received, 0% packet loss, time 7068ms
+rtt min/avg/max/mdev = 0.041/89.817/709.079/234.066 ms
+PING 10.0.0.8 (10.0.0.8) 56(84) bytes of data.
+64 bytes from 10.0.0.8: icmp_seq=1 ttl=64 time=6662 ms
+64 bytes from 10.0.0.8: icmp_seq=2 ttl=64 time=5855 ms
+64 bytes from 10.0.0.8: icmp_seq=8 ttl=64 time=3.41 ms
+64 bytes from 10.0.0.8: icmp_seq=5 ttl=64 time=3153 ms
+64 bytes from 10.0.0.8: icmp_seq=3 ttl=64 time=5463 ms
+64 bytes from 10.0.0.8: icmp_seq=9 ttl=64 time=0.331 ms
+64 bytes from 10.0.0.8: icmp_seq=6 ttl=64 time=3213 ms
+64 bytes from 10.0.0.8: icmp_seq=4 ttl=64 time=5458 ms
+64 bytes from 10.0.0.8: icmp_seq=10 ttl=64 time=10.1 ms
+64 bytes from 10.0.0.8: icmp_seq=7 ttl=64 time=3581 ms
+
+--- 10.0.0.8 ping statistics ---
+10 packets transmitted, 10 received, 0% packet loss, time 9156ms
+rtt min/avg/max/mdev = 0.331/3340.283/6662.458/2446.372 ms, pipe 7

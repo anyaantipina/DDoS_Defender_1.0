@@ -2,7 +2,12 @@
 	"name": "ddos-defender",
 	"rest": false,
 	"cli": false,
-	"alpha" : "0.5",
+	"alpha" : "0.2",
 	"TCU" : "80.5",
-	"tau" : 3
+	"tau" : 3,
+	"k" : 1,
+	"computeTableUsage" : false,
+	"computeFP_FN" : false,
+	"appEnabled" : true,
+	"logEnabled" : false
 }
